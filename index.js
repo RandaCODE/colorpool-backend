@@ -9,172 +9,240 @@ const http = require('http');
 const { Server } = require("socket.io");
 const { User, Bet, Transaction, GlobalState } = require("./models");
 
-// 1. Stable DNS fix
+// 1. Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 
-// 2. Firebase Admin Setup
-try {
-    const serviceAccount = require("./serviceAccountKey.json");
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    console.log("🔥 Firebase Admin Ready");
-} catch (e) {
-    console.error("❌ Firebase Admin Error: serviceAccountKey.json missing.");
+// =======================
+// FIREBASE ADMIN SETUP
+// =======================
+let firebaseConfigured = false;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+        if (admin.apps.length === 0) {
+            const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
+            });
+        }
+        console.log("✅ Firebase initialized via ENV");
+        firebaseConfigured = true;
+    } catch (error) {
+        console.error("❌ Firebase init error:", error.message);
+    }
+} else {
+    try {
+        const serviceAccount = require("./serviceAccountKey.json");
+        if (admin.apps.length === 0) {
+            admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        }
+        console.log("✅ Firebase initialized via local file");
+        firebaseConfigured = true;
+    } catch (e) {
+        console.warn("⚠️ Firebase credentials not found locally.");
+    }
 }
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*" }
-});
-
-app.use(cors());
-app.use(express.json());
+const io = new Server(server, { cors: { origin: "*" } });
 
 // =======================
 // CONFIGURATION
 // =======================
 const PORT = process.env.PORT || 3000;
-const MONGO_URI = "mongodb+srv://randastevenzhu_db_user:wNe4BaZ29FRDrONT@cluster0.stacjum.mongodb.net/colorpool?retryWrites=true&w=majority";
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "sk_test_your_secret_key";
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+console.log("PAYSTACK KEY EXISTS:", !!PAYSTACK_SECRET_KEY);
 
-// GAME TIMING (SYNCED 30s CYCLE)
+const MONGO_URI = process.env.MONGO_URI;
+
+// =======================
+// MIDDLEWARE
+// =======================
+app.use(cors());
+app.use(express.json());
+
+// Logger for debugging
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
+});
+
+// =======================
+// DEBUG ROUTES
+// =======================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Backend live'
+  });
+});
+
+app.get('/test-paystack', (req, res) => {
+  res.json({
+    success: true,
+    hasKey: !!process.env.PAYSTACK_SECRET_KEY
+  });
+});
+
+// PROVABLY FAIR CONSTANTS
+const PROBABILITIES = { green: 0.52, purple: 0.28, blue: 0.20 };
+const multipliers = { green: 2, purple: 3, blue: 5 };
 const ROUND_TIME = 30;
 const LOCK_AT = 10;
 const RESULT_AT = 5;
-const multipliers = { green: 2, purple: 3, blue: 5 };
 
-// STEP 1 — CREATE GAME STATE
+// =======================
+// ENGINE STATE
+// =======================
 let game = {
-    time: ROUND_TIME,
-    status: "betting", // betting | locked | result
     roundId: `R-${Date.now()}`,
+    time: ROUND_TIME,
+    status: "betting",
+    bettingLocked: false,
     winner: null,
+    serverSeed: null,
+    serverSeedHash: null,
+    clientSeed: `CLIENT_${Date.now()}`,
     pools: { green: 0, purple: 0, blue: 0 }
 };
 
 let secretCalculatedWinner = null;
 
 // =======================
-// DB CONNECTION
+// PROVABLY FAIR LOGIC
 // =======================
-mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000, family: 4 })
-.then(() => {
-    console.log("✅ MongoDB Connected");
-    initializeGame();
-})
-.catch(err => console.error("❌ DB Connection Error:", err.message));
+
+function generateServerSeed() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+function hashSeed(seed) {
+    return crypto.createHash('sha256').update(seed).digest('hex');
+}
+
+function provablyFairRandom(serverSeed, clientSeed, roundId) {
+    const combined = `${serverSeed}:${clientSeed}:${roundId}`;
+    const hash = crypto.createHash('sha256').update(combined).digest('hex');
+    const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
+
+    if (num < PROBABILITIES.green) return "green";
+    if (num < (PROBABILITIES.green + PROBABILITIES.purple)) return "purple";
+    return "blue";
+}
+
+function determineWinner(serverSeed, clientSeed, roundId, pools) {
+    const totalBets = pools.green + pools.purple + pools.blue;
+    if (totalBets === 0) return provablyFairRandom(serverSeed, clientSeed, roundId);
+
+    const payouts = {
+        green: pools.green * multipliers.green,
+        purple: pools.purple * multipliers.purple,
+        blue: pools.blue * multipliers.blue
+    };
+
+    if (Math.random() < 0.2) return provablyFairRandom(serverSeed, clientSeed, roundId);
+    return Object.keys(payouts).reduce((a, b) => payouts[a] < payouts[b] ? a : b);
+}
+
+// =======================
+// DB & INITIALIZATION
+// =======================
+if (MONGO_URI) {
+    mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000, family: 4 })
+    .then(() => {
+        console.log("✅ MongoDB Connected Successfully");
+        initializeGame();
+    })
+    .catch(err => console.error("❌ MongoDB Connection Error:", err.message));
+}
 
 async function initializeGame() {
     try {
         const saved = await GlobalState.findOne({ key: "current" });
         if (saved) game.pools = saved.pools;
     } catch (e) {}
+
+    game.serverSeed = generateServerSeed();
+    game.serverSeedHash = hashSeed(game.serverSeed);
     startGameLoop();
 }
 
-// =======================
-// ENGINE LOGIC
-// =======================
-
-function calculateWinner() {
-    const { green, purple, blue } = game.pools;
-    const totalPool = green + purple + blue;
-    const options = [
-        { color: "green", payout: green * multipliers.green },
-        { color: "purple", payout: purple * multipliers.purple },
-        { color: "blue", payout: blue * multipliers.blue }
-    ];
-    options.forEach(o => o.profit = totalPool - o.payout);
-    let profitableOptions = options.filter(o => o.profit >= 0);
-
-    let chosen;
-    if (totalPool === 0) {
-        chosen = ["green", "purple", "blue"][Math.floor(Math.random() * 3)];
-    } else if (Math.random() < 0.15) {
-        chosen = options[Math.floor(Math.random() * options.length)].color;
-    } else if (profitableOptions.length > 0) {
-        chosen = profitableOptions[Math.floor(Math.random() * profitableOptions.length)].color;
-    } else {
-        options.sort((a, b) => b.profit - a.profit);
-        chosen = options[0].color;
-    }
-    secretCalculatedWinner = chosen;
-}
-
-// STEP 4 — RESULT PROCESSING
-async function processRoundResults() {
+async function finalizeRound() {
     const winner = game.winner;
     const roundId = game.roundId;
-    console.log(`💰 Processing Payouts for Round ${roundId}. Winner: ${winner.toUpperCase()}`);
+    const winningBets = await Bet.find({ roundId, color: winner });
 
-    try {
-        const winningBets = await Bet.find({ roundId, color: winner });
-        for (const bet of winningBets) {
-            const payout = bet.amount * multipliers[winner];
-            const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payout } }, { new: true });
-            if (user) {
-                await Transaction.create({
-                    userId: bet.userId, type: 'win', amount: payout, balanceAfter: user.balance,
-                    description: `Win on ${winner} (${roundId})`, status: 'success', createdAt: new Date()
-                });
-                // Emit instant update to the winner
-                io.to(bet.userId).emit("balance_update", { balance: user.balance });
-            }
+    for (const bet of winningBets) {
+        const payout = bet.amount * multipliers[winner];
+        const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payout } }, { new: true });
+        if (user) {
+            await Transaction.create({
+                userId: bet.userId, type: 'win', amount: payout, balanceAfter: user.balance,
+                description: `Win on ${winner} (${roundId})`, status: 'success',
+                serverSeed: game.serverSeed, clientSeed: game.clientSeed, winningColor: winner, userColor: bet.color,
+                createdAt: new Date()
+            });
+            io.to(bet.userId).emit("balance_update", { balance: user.balance });
         }
-    } catch (e) {
-        console.error("❌ Payout Error:", e.message);
     }
+
+    await Transaction.updateMany(
+        { roundId: roundId, type: 'bet' },
+        { $set: { serverSeed: game.serverSeed, winningColor: winner } }
+    );
 }
 
-// STEP 2 — GAME LOOP (SERVER SIDE)
+// =======================
+// GAME LOOP
+// =======================
+let gameLoopStarted = false;
 function startGameLoop() {
-    console.log("🚀 STANDALONE ENGINE STARTED.");
+    if (gameLoopStarted) return;
+    gameLoopStarted = true;
+    console.log("🚀 Game Engine Started");
+
     setInterval(async () => {
         game.time--;
 
-        // LOCK AT 10 SECONDS
-        if (game.time === LOCK_AT) {
-            game.status = "locked";
-            game.bettingLocked = true;
-            calculateWinner(); // Calculated but not revealed
-            console.log("🔒 Betting Locked.");
+        if (game.time === ROUND_TIME - 1) {
+            io.emit("round_hash", { hash: game.serverSeedHash });
         }
 
-        // RESULT AT 5 SECONDS
-        if (game.time === RESULT_AT) {
+        if (game.time === LOCK_AT && game.status === "betting") {
+            game.bettingLocked = true;
+            game.status = "locked";
+            secretCalculatedWinner = determineWinner(game.serverSeed, game.clientSeed, game.roundId, game.pools);
+        }
+
+        if (game.time === RESULT_AT && game.status === "locked") {
             game.status = "result";
             game.winner = secretCalculatedWinner;
-
-            // STEP 5 — SOCKET EVENTS
             io.emit("round_result", { winner: game.winner });
-            console.log(`🏆 Result revealed: ${game.winner}`);
-
-            await processRoundResults();
+            io.emit("server_seed_reveal", {
+                serverSeed: game.serverSeed,
+                clientSeed: game.clientSeed,
+                roundId: game.roundId
+            });
+            await finalizeRound();
         }
 
-        // RESET AT 0
         if (game.time <= 0) {
+            const nextSeed = generateServerSeed();
             game = {
+                roundId: `R-${Date.now()}`,
                 time: ROUND_TIME,
                 status: "betting",
-                roundId: `R-${Date.now()}`,
-                winner: null,
                 bettingLocked: false,
+                winner: null,
+                serverSeed: nextSeed,
+                serverSeedHash: hashSeed(nextSeed),
+                clientSeed: `CLIENT_${Date.now()}`,
                 pools: { green: 0, purple: 0, blue: 0 }
             };
             secretCalculatedWinner = null;
-            console.log("🔁 Starting NEW Round.");
         }
 
-        // Emit update to ALL clients every second
-        io.emit("game_update", {
-            ...game,
-            calculatedWinner: undefined // Ensure hidden field is never leaked
-        });
-
-        // Sync state to DB
+        io.emit("game_update", { ...game, serverSeed: undefined });
         if (mongoose.connection.readyState === 1) {
             GlobalState.updateOne({ key: "current" }, { ...game }, { upsert: true }).catch(() => {});
         }
@@ -182,101 +250,193 @@ function startGameLoop() {
 }
 
 // =======================
-// SOCKETS & AUTH
+// AUTH MIDDLEWARE
 // =======================
 async function verifyToken(req, res, next) {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-    if (!token) return res.status(401).json({ error: 'No token' });
     try {
-        const decoded = await admin.auth().verifyIdToken(token);
-        req.user = decoded;
+        if (!firebaseConfigured) {
+            console.warn("verifyToken: Firebase service account not configured");
+            return res.status(503).json({ success: false, error: 'Auth unavailable' });
+        }
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ success: false, error: 'No token provided' });
+        }
+        const token = authHeader.split('Bearer ')[1];
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = decodedToken;
         next();
-    } catch (e) { res.status(401).json({ error: 'Invalid token' }); }
-}
-
-io.on("connection", (socket) => {
-    const userId = socket.handshake.query.userId;
-    if (userId && userId !== 'user1') {
-        socket.join(userId);
-        console.log(`👤 User joined: ${userId}`);
+    } catch (error) {
+        console.error("Auth Error:", error.message);
+        return res.status(401).json({ success: false, error: 'Invalid or expired token' });
     }
-    // Send current game state immediately
-    socket.emit("game_update", game);
-});
+}
 
 // =======================
 // API ROUTES
 // =======================
+app.get('/health', (req, res) => res.json({ success: true, status: "healthy" }));
 
 app.get('/game-state', async (req, res) => {
-    const userId = req.query.userId || "guest";
+    const userId = req.query.userId || "user1";
     try {
         let user = await User.findOne({ userId });
-        res.json({ ...game, balance: user?.balance || 0 });
-    } catch (e) { res.status(500).json({ error: "DB Error" }); }
+        return res.json({ ...game, serverSeed: undefined, balance: user?.balance || 0 });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: "Database error" });
+    }
 });
 
-app.post('/me', verifyToken, async (req, res) => {
-    try {
-        let user = await User.findOne({ userId: req.user.uid });
-        if (!user) user = await User.create({ userId: req.user.uid, email: req.user.email, balance: 1000 });
-        res.json(user);
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// STEP 3 — BET VALIDATION
 app.post('/bet', verifyToken, async (req, res) => {
     const { color, amount } = req.body;
-    const userId = req.user.uid;
-
-    if (game.status !== "betting" || game.bettingLocked) {
-        return res.status(400).json({ error: "Betting closed" });
-    }
-
+    if (game.status !== "betting" || game.bettingLocked) return res.status(400).json({ success: false, error: "Round is locked" });
     try {
-        const user = await User.findOneAndUpdate({ userId, balance: { $gte: amount } }, { $inc: { balance: -amount } }, { new: true });
-        if (!user) return res.status(400).json({ error: "Insufficient balance" });
+        const user = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: amount } }, { $inc: { balance: -amount } }, { new: true });
+        if (!user) return res.status(400).json({ success: false, error: "Insufficient balance" });
 
-        await Bet.create({ userId, roundId: game.roundId, color: color.toLowerCase(), amount, time: new Date() });
+        await Bet.create({ userId: req.user.uid, roundId: game.roundId, color: color.toLowerCase(), amount, time: new Date() });
         game.pools[color.toLowerCase()] += amount;
 
         await Transaction.create({
-            userId, type: 'bet', amount: -amount, balanceAfter: user.balance,
-            description: `Bet on ${color}`, status: 'success', createdAt: new Date()
+            userId: req.user.uid, type: 'bet', amount: -amount, balanceAfter: user.balance,
+            description: `Bet on ${color}`, status: 'success',
+            roundId: game.roundId, serverSeedHash: game.serverSeedHash, clientSeed: game.clientSeed, userColor: color.toLowerCase(),
+            createdAt: new Date()
         });
 
         io.emit("pool_update", game.pools);
-        res.json({ success: true, balance: user.balance });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        io.emit("new_bet", {
+            username: user.email.split('@')[0], amount, color: color.toLowerCase(), time: new Date()
+        });
+
+        return res.json({ success: true, balance: user.balance });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
 });
 
-app.post('/withdraw', verifyToken, async (req, res) => {
-    const { amount, bankDetails } = req.body;
+// =======================
+// PAYSTACK ROUTES
+// =======================
+
+app.post('/initialize-payment', verifyToken, async (req, res) => {
+    console.log("Initialize payment route hit");
+    const { email, amount } = req.body;
+
+    if (!email || !amount) {
+        return res.status(400).json({ success: false, error: "Email and amount are required in body" });
+    }
+
+    if (!PAYSTACK_SECRET_KEY) {
+        console.error("PAYSTACK_SECRET_KEY is missing in process.env");
+        return res.status(500).json({ success: false, error: "Server misconfiguration: Payment key missing" });
+    }
+
     try {
-        const user = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: amount } }, { $inc: { balance: -amount } }, { new: true });
-        if (!user) return res.status(400).json({ error: "Insufficient balance" });
-        await Transaction.create({ userId: req.user.uid, type: 'withdraw', amount: -amount, balanceAfter: user.balance, status: 'pending', bankDetails, createdAt: new Date() });
-        res.json({ success: true, balance: user.balance });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const response = await axios.post('https://api.paystack.co/transaction/initialize', {
+            email: email,
+            amount: Math.round(amount * 100), // Paystack uses kobo
+        }, {
+            headers: {
+                Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json',
+            }
+        });
+
+        if (response.data && response.data.status) {
+            console.log(`Payment initialized for ${email}: ${response.data.data.reference}`);
+            return res.json({
+                success: true,
+                authorization_url: response.data.data.authorization_url,
+                reference: response.data.data.reference
+            });
+        } else {
+            return res.status(400).json({ success: false, error: "Paystack initialization failed" });
+        }
+    } catch (error) {
+        console.error("Paystack Init Error:", error.response?.data || error.message);
+        return res.status(500).json({
+            success: false,
+            error: error.response?.data?.message || error.message || "External payment service error"
+        });
+    }
 });
 
-app.post('/claim-bonus', verifyToken, async (req, res) => {
-    const userId = req.user.uid;
-    const user = await User.findOne({ userId });
-    const now = new Date();
-    if (user.lastBonusClaimTime && (now - user.lastBonusClaimTime < 24*60*60*1000)) return res.status(400).json({ error: "Wait 24h" });
-    const update = await User.findOneAndUpdate({ userId }, { $inc: { balance: 500, playStreak: 1 }, $set: { lastBonusClaimTime: now } }, { new: true });
-    await Transaction.create({ userId, type: 'bonus', amount: 500, balanceAfter: update.balance, description: 'Daily Bonus', status: 'success', createdAt: new Date() });
-    res.json({ success: true, balance: update.balance });
-});
+app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
+    console.log(`Verify payment route hit for ref: ${req.params.reference}`);
+    const { reference } = req.params;
 
-app.get('/transactions', verifyToken, async (req, res) => {
+    if (!PAYSTACK_SECRET_KEY) {
+        return res.status(500).json({ success: false, error: "Server configuration error" });
+    }
+
     try {
-        const txs = await Transaction.find({ userId: req.user.uid }).sort({ createdAt: -1 }).limit(50);
-        res.json(txs);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
+            headers: {
+                Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+            }
+        });
+
+        if (response.data && response.data.status && response.data.data.status === 'success') {
+            const amount = response.data.data.amount / 100;
+            const userId = req.user.uid;
+
+            // Prevent double crediting by checking unique reference
+            const existingTx = await Transaction.findOne({ reference, status: 'success' });
+            if (existingTx) {
+                const user = await User.findOne({ userId });
+                return res.json({ success: true, balance: user.balance, message: "Already credited" });
+            }
+
+            const user = await User.findOneAndUpdate(
+                { userId },
+                { $inc: { balance: amount } },
+                { new: true, upsert: true }
+            );
+
+            await Transaction.create({
+                userId,
+                type: 'deposit',
+                amount,
+                balanceAfter: user.balance,
+                description: 'Paystack Deposit',
+                status: 'success',
+                reference,
+                createdAt: new Date()
+            });
+
+            io.to(userId).emit("balance_update", { balance: user.balance });
+            console.log(`Deposit successful: ${amount} NGN credited to ${userId}`);
+            return res.json({ success: true, balance: user.balance });
+        } else {
+            return res.status(400).json({ success: false, error: "Payment verification failed: Not successful" });
+        }
+    } catch (error) {
+        console.error("Paystack Verify Error:", error.response?.data || error.message);
+        return res.status(500).json({
+            success: false,
+            error: error.response?.data?.message || error.message || "Payment verification service error"
+        });
+    }
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 STANDALONE ENGINE ON PORT ${PORT}`);
+// =======================
+// ERROR HANDLING (JSON ONLY)
+// =======================
+app.use((req, res) => {
+    console.warn(`404 hit: ${req.method} ${req.url}`);
+    res.status(404).json({ success: false, error: "Route not found. Ensure you are using the correct backend URL." });
 });
+
+app.use((err, req, res, next) => {
+    console.error("CRITICAL SERVER ERROR:", err.stack);
+    res.status(500).json({ success: false, error: "An internal server error occurred. Please try again later." });
+});
+
+io.on("connection", (socket) => {
+    const userId = socket.handshake.query.userId;
+    if (userId && userId !== 'user1') socket.join(userId);
+    socket.emit("game_update", { ...game, serverSeed: undefined });
+});
+
+server.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server fully operational on port ${PORT}`));
