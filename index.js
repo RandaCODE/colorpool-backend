@@ -315,6 +315,7 @@ function startGameLoop() {
                 pools: { green: 0, purple: 0, blue: 0 }
             };
             io.emit("pool_update", game.pools);
+            io.emit("round_reset", { roundId: game.roundId });
         }
 
         // Broadcast state to all users
@@ -395,7 +396,12 @@ app.get('/my-bets', verifyToken, async (req, res) => {
 
 app.get('/all-bets', async (req, res) => {
     try {
-        const bets = await Transaction.find({ type: 'bet' }).sort({ createdAt: -1 }).limit(50);
+        // Only return bets for the current active round
+        const bets = await Transaction.find({
+            type: 'bet',
+            roundId: game.roundId
+        }).sort({ createdAt: -1 }).limit(50);
+
         const userIds = [...new Set(bets.map(b => b.userId))];
         const users = await User.find({ userId: { $in: userIds } });
         const userMap = users.reduce((acc, u) => ({ ...acc, [u.userId]: u }), {});
@@ -512,111 +518,81 @@ app.post('/initialize-payment', verifyToken, async (req, res) => {
     if (!email || !amount) {
         return res.status(400).json({ success: false, error: "Email and amount are required" });
     }
-    const reference = `REF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
     try {
-        // Create pending transaction first
-        await Transaction.create({
-            userId: req.user.uid,
-            type: 'deposit',
-            amount,
-            reference,
-            status: 'pending',
-            description: 'Paystack Initiation'
+        const response = await paystackAxios.post('/transaction/initialize', {
+            email,
+            amount: amount * 100, // Convert to Kobo
+            callback_url: "https://your-domain.com/verify-payment", // Optional callback
+            metadata: {
+                userId: req.user.uid,
+                custom_fields: [
+                    { display_name: "User ID", variable_name: "user_id", value: req.user.uid }
+                ]
+            }
+        }, {
+            headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
         });
 
-        if (!PAYSTACK_SECRET_KEY) {
-             // Mock success for development if key is missing
-             return res.json({
-                success: true,
-                data: {
-                    authorization_url: "#mock-payment",
-                    reference: reference
-                }
-            });
-        }
-
-        const response = await paystackAxios.post('/transaction/initialize',
-            { email, amount: Math.round(amount * 100), reference },
-            { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
-        );
-
-        if (response.data && response.data.status && response.data.data) {
-            return res.json({
-                success: true,
-                data: {
-                    authorization_url: response.data.data.authorization_url,
-                    reference: reference
-                }
-            });
-        } else {
-            throw new Error(response.data?.message || "Paystack initialization failed");
-        }
+        res.json({ success: true, data: response.data.data });
     } catch (e) {
-        console.error("🚨 Paystack Error:", e.response?.data || e.message);
-        res.status(500).json({ success: false, error: e.message || "Payment gateway timeout. Please retry." });
+        console.error("🚨 Payment Init Error:", e.response?.data || e.message);
+        res.status(500).json({ success: false, error: "Payment gateway unavailable" });
     }
 });
 
 app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
     const { reference } = req.params;
     try {
-        const existing = await Transaction.findOne({ reference, status: 'success' });
-        if (existing) {
-            const user = await User.findOne({ userId: req.user.uid });
-            return res.json({ success: true, data: { balance: user.balance } });
-        }
-
-        if (!PAYSTACK_SECRET_KEY) {
-            // Mock verify for development
-            const tx = await Transaction.findOne({ reference });
-            if (tx) {
-                const user = await User.findOneAndUpdate(
-                    { userId: req.user.uid },
-                    { $inc: { balance: tx.amount } },
-                    { new: true, upsert: true }
-                );
-                tx.status = 'success';
-                tx.balanceAfter = user.balance;
-                await tx.save();
-                io.to(req.user.uid).emit("balance_update", { balance: user.balance });
-                io.to(req.user.uid).emit("transaction_update");
-                return res.json({ success: true, data: { balance: user.balance } });
-            }
-        }
-
         const response = await paystackAxios.get(`/transaction/verify/${reference}`, {
             headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
         });
 
-        if (response.data.data.status === 'success') {
-            const amount = response.data.data.amount / 100;
+        const data = response.data.data;
+        if (data.status === 'success') {
+            const amountInNaira = data.amount / 100;
+            const userId = data.metadata.userId;
 
+            // Check if transaction already processed
+            const existingTx = await Transaction.findOne({ reference });
+            if (existingTx) {
+                const user = await User.findOne({ userId });
+                return res.json({ success: true, balance: user.balance, message: "Payment already processed" });
+            }
+
+            // Atomic balance update
             const user = await User.findOneAndUpdate(
-                { userId: req.user.uid },
-                { $inc: { balance: amount } },
+                { userId },
+                { $inc: { balance: amountInNaira } },
                 { new: true, upsert: true }
             );
 
-            await Transaction.findOneAndUpdate(
-                { reference },
-                { status: 'success', balanceAfter: user.balance }
-            );
+            // Record transaction
+            await Transaction.create({
+                userId,
+                type: 'deposit',
+                amount: amountInNaira,
+                balanceAfter: user.balance,
+                description: 'Deposit via Paystack',
+                status: 'success',
+                reference
+            });
 
-            io.to(req.user.uid).emit("balance_update", { balance: user.balance });
-            io.to(req.user.uid).emit("transaction_update");
+            io.to(userId).emit("balance_update", { balance: user.balance });
+            io.to(userId).emit("transaction_update");
 
-            return res.json({ success: true, data: { balance: user.balance } });
+            return res.json({ success: true, balance: user.balance });
         }
-        res.status(400).json({ success: false, error: "Payment not successful on Paystack" });
+        res.status(400).json({ success: false, error: "Payment not successful" });
     } catch (e) {
-        console.error("🚨 Verification Error:", e.message);
+        console.error("🚨 Verify Error:", e.response?.data || e.message);
         res.status(500).json({ success: false, error: "Verification failed" });
     }
 });
 
 app.post('/withdraw', verifyToken, async (req, res) => {
-    const { amount, bankDetails } = req.body;
-    if (!amount || amount < 1000) return res.status(400).json({ success: false, error: "Minimum withdrawal is 1000" });
+    const { amount, bankName, accountNumber } = req.body;
+    if (!amount || amount < 2000) return res.status(400).json({ success: false, error: "Minimum withdrawal is 2000" });
 
     try {
         const user = await User.findOneAndUpdate(
@@ -632,40 +608,36 @@ app.post('/withdraw', verifyToken, async (req, res) => {
             type: 'withdrawal',
             amount: -amount,
             balanceAfter: user.balance,
+            description: `Withdrawal to ${bankName}`,
             status: 'pending',
-            bankDetails,
-            description: `Withdrawal to ${bankDetails.bankName}`
+            bankDetails: { bankName, accountNumber }
         });
 
         io.to(req.user.uid).emit("balance_update", { balance: user.balance });
         io.to(req.user.uid).emit("transaction_update");
 
-        res.json({ success: true, data: { balance: user.balance } });
+        res.json({ success: true, balance: user.balance });
     } catch (e) {
-        res.status(500).json({ success: false, error: "Withdrawal processing failed" });
+        res.status(500).json({ success: false, error: "Withdrawal failed" });
     }
 });
 
 app.post('/claim-bonus', verifyToken, async (req, res) => {
     try {
-        const bonusAmount = 500;
         const user = await User.findOne({ userId: req.user.uid });
+        const now = Date.now();
+        const lastClaim = user.lastBonusClaimTime ? user.lastBonusClaimTime.getTime() : 0;
 
-        if (!user) return res.status(404).json({ success: false, error: "User not found" });
-
-        const now = new Date();
-        const lastClaim = user.lastBonusClaimTime ? new Date(user.lastBonusClaimTime) : new Date(0);
-        const diffMs = now - lastClaim;
-
-        if (diffMs < 86400000) {
-            return res.status(400).json({ success: false, error: "Bonus already claimed in the last 24h" });
+        if (now - lastClaim < 86400000) {
+            return res.status(400).json({ success: false, error: "Bonus already claimed today" });
         }
 
+        const bonus = 100;
         const updatedUser = await User.findOneAndUpdate(
             { userId: req.user.uid },
             {
-                $inc: { balance: bonusAmount, playStreak: 1 },
-                $set: { lastBonusClaimTime: now }
+                $inc: { balance: bonus },
+                $set: { lastBonusClaimTime: new Date() }
             },
             { new: true }
         );
@@ -673,7 +645,7 @@ app.post('/claim-bonus', verifyToken, async (req, res) => {
         await Transaction.create({
             userId: req.user.uid,
             type: 'bonus',
-            amount: bonusAmount,
+            amount: bonus,
             balanceAfter: updatedUser.balance,
             description: 'Daily Bonus',
             status: 'success'
@@ -682,18 +654,12 @@ app.post('/claim-bonus', verifyToken, async (req, res) => {
         io.to(req.user.uid).emit("balance_update", { balance: updatedUser.balance });
         io.to(req.user.uid).emit("transaction_update");
 
-        res.json({
-            success: true,
-            data: {
-                balance: updatedUser.balance,
-                playStreak: updatedUser.playStreak
-            }
-        });
+        res.json({ success: true, balance: updatedUser.balance });
     } catch (e) {
         res.status(500).json({ success: false, error: "Bonus claim failed" });
     }
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Production Server Operational on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
 });
