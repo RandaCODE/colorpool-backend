@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const admin = require('firebase-admin');
 const http = require('http');
 const { Server } = require("socket.io");
-const { User, Bet, Transaction, GlobalState, Round } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round, WebhookEvent } = require("./models");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -62,7 +62,13 @@ io.on("connection", (socket) => {
 // MIDDLEWARE & LOGGING
 // =======================
 app.use(cors());
-app.use(express.json());
+
+// Capture raw body for Paystack signature verification
+app.use(express.json({
+    verify: (req, res, buf) => {
+        req.rawBody = buf;
+    }
+}));
 
 app.use((req, res, next) => {
     const start = Date.now();
@@ -589,6 +595,89 @@ app.post('/initialize-payment', verifyToken, async (req, res) => {
     } catch (e) {
         console.error("🚨 Payment Init Error:", e.response?.data || e.message);
         res.status(500).json({ success: false, error: "Payment gateway unavailable" });
+    }
+});
+
+app.post('/paystack/webhook', async (req, res) => {
+    // 1. Verify Signature
+    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)
+        .update(req.rawBody)
+        .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+        console.warn("⚠️ [Webhook] Invalid Signature detected.");
+        return res.status(401).send('Invalid signature');
+    }
+
+    const event = req.body;
+    if (event.event !== 'charge.success') {
+        return res.sendStatus(200); // We only care about successful charges
+    }
+
+    const { reference, amount, metadata } = event.data;
+    const userId = metadata?.userId;
+
+    if (!userId) {
+        console.error("❌ Webhook Error: No userId in metadata for ref:", reference);
+        return res.sendStatus(200);
+    }
+
+    try {
+        // 2. Check for duplicate processing in WebhookEvent log
+        const existingEvent = await WebhookEvent.findOne({ reference });
+        if (existingEvent && existingEvent.processed) {
+            return res.sendStatus(200);
+        }
+
+        // 3. Double check Transaction record for idempotency
+        const existingTx = await Transaction.findOne({ reference });
+        if (existingTx) {
+            if (!existingEvent) {
+                await WebhookEvent.create({ event: event.event, reference, payload: event, processed: true });
+            } else {
+                existingEvent.processed = true;
+                await existingEvent.save();
+            }
+            return res.sendStatus(200);
+        }
+
+        const amountInNaira = amount / 100;
+
+        // 4. Atomic balance update
+        const user = await User.findOneAndUpdate(
+            { userId },
+            { $inc: { balance: amountInNaira } },
+            { new: true, upsert: true }
+        );
+
+        // 5. Record transaction record
+        await Transaction.create({
+            userId,
+            type: 'deposit',
+            amount: amountInNaira,
+            balanceAfter: user.balance,
+            description: 'Deposit via Paystack (Webhook)',
+            status: 'success',
+            reference
+        });
+
+        // 6. Mark webhook event as processed
+        if (existingEvent) {
+            existingEvent.processed = true;
+            await existingEvent.save();
+        } else {
+            await WebhookEvent.create({ event: event.event, reference, payload: event, processed: true });
+        }
+
+        // 7. Push real-time updates
+        io.to(userId).emit("balance_update", { balance: user.balance });
+        io.to(userId).emit("transaction_update");
+
+        console.log(`✅ [Webhook] Payment Credited: ${amountInNaira} to ${userId} (Ref: ${reference})`);
+        res.sendStatus(200);
+    } catch (e) {
+        console.error("🚨 Webhook Processing Error:", e.message);
+        res.sendStatus(500);
     }
 });
 

@@ -44,6 +44,14 @@ const transactionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, index: true }
 });
 
+const webhookEventSchema = new mongoose.Schema({
+  event: String,
+  reference: { type: String, unique: true, index: true }, // Made unique for idempotency
+  payload: Object,
+  processed: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
 const roundSchema = new mongoose.Schema({
   roundId: { type: String, unique: true, index: true },
   winner: String,
@@ -79,6 +87,7 @@ module.exports = {
   User: mongoose.model('User', userSchema),
   Bet: mongoose.model('Bet', betSchema),
   Transaction: mongoose.model('Transaction', transactionSchema),
+  WebhookEvent: mongoose.model('WebhookEvent', webhookEventSchema),
   GlobalState: mongoose.model('GlobalState', globalStateSchema),
   Round: mongoose.model('Round', roundSchema)
 };
