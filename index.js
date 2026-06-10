@@ -423,6 +423,28 @@ app.get('/all-bets', async (req, res) => {
     }
 });
 
+app.get('/round/:roundId', async (req, res) => {
+    try {
+        const round = await Round.findOne({ roundId: req.params.roundId });
+        if (!round) {
+            return res.status(404).json({ success: false, error: "Round not found" });
+        }
+        res.json({
+            success: true,
+            data: {
+                roundId: round.roundId,
+                serverSeed: round.serverSeed,
+                serverSeedHash: round.serverSeedHash,
+                clientSeed: round.clientSeed,
+                winningColor: round.winner,
+                createdAt: round.createdAt
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: "Failed to fetch round data" });
+    }
+});
+
 app.get('/top-wins', async (req, res) => {
     try {
         const wins = await Transaction.find({ type: 'win' }).sort({ amount: -1 }).limit(10);
