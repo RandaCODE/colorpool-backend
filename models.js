@@ -19,6 +19,7 @@ const betSchema = new mongoose.Schema({
   color: String,
   amount: Number,
   transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
+  settled: { type: Boolean, default: false, index: true }, // Added for idempotency
   time: { type: Date, default: Date.now }
 });
 

@@ -107,18 +107,21 @@ async function verifyToken(req, res, next) {
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ success: false, error: 'Auth context lost. Please login again.' });
+            return res.status(401).json({ success: false, error: 'Authentication required. Please login again.' });
         }
+
         const token = authHeader.split('Bearer ')[1];
+
         if (!firebaseConfigured) {
-            // Fallback for development if Firebase is not setup
-            req.user = { uid: "dev_user" };
-            return next();
+            console.error("❌ Security Alert: Attempted auth while Firebase is not configured.");
+            return res.status(500).json({ success: false, error: 'Internal Authentication Service Error' });
         }
+
         const decodedToken = await admin.auth().verifyIdToken(token);
         req.user = decodedToken;
         next();
     } catch (error) {
+        console.error("❌ Auth Error:", error.message);
         return res.status(401).json({ success: false, error: 'Invalid or expired session' });
     }
 }
@@ -188,17 +191,33 @@ async function finalizeRound() {
     console.log(`🎯 [Engine] Finalizing Round ${roundId}. Winner: ${winner.toUpperCase()}`);
 
     try {
-        // 1. Create Round Record
+        // 1. Check if Round already exists to prevent duplicate overall settlement
+        const existingRound = await Round.findOne({ roundId });
+        if (existingRound) {
+            console.log(`⚠️ [Engine] Round ${roundId} already finalized. Skipping.`);
+            return;
+        }
+
+        // 2. Create Round Record
         await Round.create({
             roundId, winner, serverSeed: game.serverSeed, serverSeedHash: game.serverSeedHash,
             clientSeed: game.clientSeed, pools: game.pools
         });
 
-        // 2. Fetch all bets for this round
-        const allBetsInRound = await Bet.find({ roundId });
+        // 3. Fetch only non-settled bets for this round
+        const allBetsInRound = await Bet.find({ roundId, settled: false });
 
-        // 3. Process each bet atomically
+        // 4. Process each bet atomically
         for (const bet of allBetsInRound) {
+            // Atomically mark as settled BEFORE payout to prevent double-pay on concurrent re-runs
+            const processLock = await Bet.findOneAndUpdate(
+                { _id: bet._id, settled: false },
+                { $set: { settled: true } },
+                { new: true }
+            );
+
+            if (!processLock) continue; // Already processed by another worker or thread
+
             const isWinner = bet.color.toLowerCase() === winner.toLowerCase();
             const user = await User.findOne({ userId: bet.userId });
             const username = getUsername(user);
@@ -473,58 +492,68 @@ app.get('/top-wins', async (req, res) => {
 
 app.post('/bet', verifyToken, async (req, res) => {
     const { color, amount } = req.body;
+
+    // SECURITY FIX: Capture roundId locally to prevent drift
+    const activeRoundId = game.roundId;
+
     if (game.status !== "betting" || game.bettingLocked) {
         return res.status(400).json({ success: false, error: "Round is locked or not in betting phase" });
     }
-    if (!amount || amount < 100) {
+
+    // SECURITY FIX: Explicitly ensure amount is a positive integer
+    const betAmount = Math.floor(Number(amount));
+    if (!betAmount || betAmount < 100) {
         return res.status(400).json({ success: false, error: "Minimum bet is 100" });
     }
 
     try {
         // Atomic balance check and deduction
         const user = await User.findOneAndUpdate(
-            { userId: req.user.uid, balance: { $gte: amount } },
-            { $inc: { balance: -amount, "stats.totalBets": 1 } },
+            { userId: req.user.uid, balance: { $gte: betAmount } },
+            { $inc: { balance: -betAmount, "stats.totalBets": 1 } },
             { new: true }
         );
 
         if (!user) return res.status(400).json({ success: false, error: "Insufficient balance" });
 
-        // Create transaction record FIRST
+        // Create transaction record using the captured activeRoundId
         const tx = await Transaction.create({
             userId: req.user.uid,
             type: 'bet',
-            amount: -amount,
+            amount: -betAmount,
             balanceAfter: user.balance,
             description: `Bet on ${color.toUpperCase()}`,
             status: 'pending',
-            roundId: game.roundId,
+            roundId: activeRoundId,
             userColor: color.toLowerCase()
         });
 
         // Record bet for pool logic, linking the transaction
         await Bet.create({
             userId: req.user.uid,
-            roundId: game.roundId,
+            roundId: activeRoundId,
             color: color.toLowerCase(),
-            amount,
+            amount: betAmount,
             transactionId: tx._id
         });
 
-        // Update live pools
-        game.pools[color.toLowerCase()] += amount;
+        // Update live pools (only if round hasn't flipped, or we update the pool for the specific round)
+        // Note: Global pools are for display only, settlement uses the Bet records.
+        if (game.roundId === activeRoundId) {
+            game.pools[color.toLowerCase()] += betAmount;
+            io.emit("pool_update", game.pools);
+        }
 
         // Broadcast updates
-        io.emit("pool_update", game.pools);
         io.to(req.user.uid).emit("balance_update", { balance: user.balance });
         io.to(req.user.uid).emit("transaction_update");
         io.emit("new_bet", {
             id: tx._id,
             userId: req.user.uid,
             username: getUsername(user),
-            amount,
+            amount: betAmount,
             color: color.toLowerCase(),
-            roundId: game.roundId,
+            roundId: activeRoundId,
             result: "PENDING"
         });
 
@@ -544,7 +573,7 @@ app.post('/initialize-payment', verifyToken, async (req, res) => {
     try {
         const response = await paystackAxios.post('/transaction/initialize', {
             email,
-            amount: amount * 100, // Convert to Kobo
+            amount: Math.floor(amount * 100), // Convert to Kobo
             callback_url: "https://your-domain.com/verify-payment", // Optional callback
             metadata: {
                 userId: req.user.uid,
@@ -646,23 +675,30 @@ app.post('/withdraw', verifyToken, async (req, res) => {
 
 app.post('/claim-bonus', verifyToken, async (req, res) => {
     try {
-        const user = await User.findOne({ userId: req.user.uid });
-        const now = Date.now();
-        const lastClaim = user.lastBonusClaimTime ? user.lastBonusClaimTime.getTime() : 0;
-
-        if (now - lastClaim < 86400000) {
-            return res.status(400).json({ success: false, error: "Bonus already claimed today" });
-        }
+        const now = new Date();
+        const oneDayAgo = new Date(now.getTime() - 86400000);
 
         const bonus = 100;
+
+        // SECURITY FIX: Atomic once-per-day check using findOneAndUpdate query
         const updatedUser = await User.findOneAndUpdate(
-            { userId: req.user.uid },
+            {
+                userId: req.user.uid,
+                $or: [
+                    { lastBonusClaimTime: { $lt: oneDayAgo } },
+                    { lastBonusClaimTime: null }
+                ]
+            },
             {
                 $inc: { balance: bonus },
-                $set: { lastBonusClaimTime: new Date() }
+                $set: { lastBonusClaimTime: now }
             },
             { new: true }
         );
+
+        if (!updatedUser) {
+            return res.status(400).json({ success: false, error: "Bonus already claimed today" });
+        }
 
         await Transaction.create({
             userId: req.user.uid,
@@ -678,6 +714,7 @@ app.post('/claim-bonus', verifyToken, async (req, res) => {
 
         res.json({ success: true, balance: updatedUser.balance });
     } catch (e) {
+        console.error("🚨 Bonus Error:", e.message);
         res.status(500).json({ success: false, error: "Bonus claim failed" });
     }
 });
