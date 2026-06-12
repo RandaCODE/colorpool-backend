@@ -119,10 +119,12 @@ const schemas = {
     }),
     withdraw: Joi.object({
         amount: Joi.number().min(2000).max(500000).required(),
-        bankName: Joi.string().required(),
-        accountNumber: Joi.string().pattern(/^\d+$/).min(10).max(10).required(),
-        bankCode: Joi.string().required(),
-        accountName: Joi.string().required()
+        bankDetails: Joi.object({
+            bankName: Joi.string().required(),
+            accountNumber: Joi.string().pattern(/^\d+$/).min(10).max(10).required(),
+            bankCode: Joi.string().required(),
+            accountName: Joi.string().required()
+        }).required()
     }),
     deposit: Joi.object({
         email: Joi.string().email().required(),
@@ -407,7 +409,7 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
         await session.withTransaction(async () => {
             const u = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: kobo } }, { $inc: { balance: -kobo } }, { session, new: true });
             if (!u) throw new Error("Insufficient funds");
-            await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body }], { session });
+            await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body.bankDetails }], { session });
         });
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
