@@ -3,10 +3,11 @@ const mongoose = require('mongoose');
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   email: { type: String, default: "user@example.com" },
-  balance: { type: Number, default: 0 },
+  balance: { type: Number, default: 0 }, // ALWAYS STORED IN KOBO (Integer)
   playStreak: { type: Number, default: 0 },
   lastBonusClaimTime: { type: Date, default: null },
   isFlagged: { type: Boolean, default: false },
+  isAdmin: { type: Boolean, default: false },
   stats: {
     totalBets: { type: Number, default: 0 },
     totalWins: { type: Number, default: 0 }
@@ -17,36 +18,56 @@ const betSchema = new mongoose.Schema({
   userId: { type: String, index: true },
   roundId: { type: String, index: true },
   color: String,
-  amount: Number,
+  amount: { type: Number, required: true }, // STORED IN KOBO
   transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
-  settled: { type: Boolean, default: false, index: true }, // Added for idempotency
+  settled: { type: Boolean, default: false, index: true },
   time: { type: Date, default: Date.now }
 });
 
+/**
+ * INDEX RATIONALE:
+ * 1. { userId, time }: Optimized for "My Bets" history retrieval.
+ * 2. { roundId, settled }: Critical for the game engine to finalize rounds efficiently.
+ */
+betSchema.index({ userId: 1, time: -1 });
+betSchema.index({ roundId: 1, settled: 1 });
+
 const transactionSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  // type: 'bet', 'win', 'deposit', 'withdrawal', 'bonus'
-  type: { type: String, required: true, index: true },
-  amount: { type: Number, required: true },
-  payout: { type: Number, default: 0 }, // Added for easy history retrieval
-  balanceAfter: { type: Number },
+  userId: { type: String, required: true },
+  type: { type: String, required: true },
+  amount: { type: Number, required: true }, // STORED IN KOBO (can be negative for bets/withdrawals)
+  payout: { type: Number, default: 0 },     // STORED IN KOBO
+  balanceAfter: { type: Number },           // STORED IN KOBO
   description: { type: String },
-  status: { type: String, enum: ['pending', 'success', 'failed'], default: 'success' },
-  reference: { type: String, unique: true, sparse: true }, // For Paystack
+  status: { type: String, enum: ['pending', 'success', 'failed', 'rejected'], default: 'success' },
+  reference: { type: String, unique: true, sparse: true },
   bankDetails: {
     accountNumber: String,
-    bankName: String
+    bankName: String,
+    bankCode: String,
+    accountName: String
   },
-  // Game Context
-  roundId: { type: String, index: true },
+  adminNotes: String,
+  processedBy: String,
+  roundId: { type: String },
   winningColor: { type: String },
   userColor: { type: String },
-  createdAt: { type: Date, default: Date.now, index: true }
+  createdAt: { type: Date, default: Date.now }
 });
+
+/**
+ * INDEX RATIONALE:
+ * 1. { userId, createdAt }: Standard history lookup for users.
+ * 2. { userId, type, createdAt }: Filtered history lookup (e.g., "Show only my deposits").
+ * 3. { status, type }: Critical for Admin Dashboard to fetch pending withdrawals instantly.
+ */
+transactionSchema.index({ userId: 1, createdAt: -1 });
+transactionSchema.index({ userId: 1, type: 1, createdAt: -1 });
+transactionSchema.index({ status: 1, type: 1 });
 
 const webhookEventSchema = new mongoose.Schema({
   event: String,
-  reference: { type: String, unique: true, index: true }, // Made unique for idempotency
+  reference: { type: String, unique: true, index: true },
   payload: Object,
   processed: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
