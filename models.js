@@ -16,26 +16,24 @@ const userSchema = new mongoose.Schema({
 
 const betSchema = new mongoose.Schema({
   userId: { type: String, index: true },
+  username: { type: String, default: "User" },
   roundId: { type: String, index: true },
   color: String,
   amount: { type: Number, required: true }, // STORED IN KOBO
   transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
   settled: { type: Boolean, default: false, index: true },
+  result: { type: String, enum: ['WON', 'LOST', 'PENDING'], default: 'PENDING' },
+  payout: { type: Number, default: 0 },
   time: { type: Date, default: Date.now }
 });
 
-/**
- * INDEX RATIONALE:
- * 1. { userId, time }: Optimized for "My Bets" history retrieval.
- * 2. { roundId, settled }: Critical for the game engine to finalize rounds efficiently.
- */
 betSchema.index({ userId: 1, time: -1 });
 betSchema.index({ roundId: 1, settled: 1 });
 
 const transactionSchema = new mongoose.Schema({
   userId: { type: String, required: true },
   type: { type: String, required: true },
-  amount: { type: Number, required: true }, // STORED IN KOBO (can be negative for bets/withdrawals)
+  amount: { type: Number, required: true }, // STORED IN KOBO
   payout: { type: Number, default: 0 },     // STORED IN KOBO
   balanceAfter: { type: Number },           // STORED IN KOBO
   description: { type: String },
@@ -55,12 +53,6 @@ const transactionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-/**
- * INDEX RATIONALE:
- * 1. { userId, createdAt }: Standard history lookup for users.
- * 2. { userId, type, createdAt }: Filtered history lookup (e.g., "Show only my deposits").
- * 3. { status, type }: Critical for Admin Dashboard to fetch pending withdrawals instantly.
- */
 transactionSchema.index({ userId: 1, createdAt: -1 });
 transactionSchema.index({ userId: 1, type: 1, createdAt: -1 });
 transactionSchema.index({ status: 1, type: 1 });
