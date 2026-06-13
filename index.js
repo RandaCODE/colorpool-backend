@@ -305,18 +305,24 @@ const mapBet = b => {
     return { ...o, id: o._id, amount: o.amount / 100, payout: o.payout / 100 };
 };
 
+/**
+ * Maps transaction object for API consumption.
+ * Ensures 'amount' represents the stake and 'payout' represents the total return.
+ * Implements legacy reconstruction for older records.
+ */
 const mapTx = t => {
     const o = t.toObject ? t.toObject() : t;
 
-    let amount = Math.abs(o.amount || 0) / 100;
-    let payout = (o.payout || 0) / 100;
+    let amount = Math.abs(o.amount || 0) / 100; // Stake
+    let payout = (o.payout || 0) / 100;         // Total Return
 
-    // Legacy fix for 'win' transactions where payout wasn't stored separately
-    if (o.type === 'win' && payout === 0 && amount > 0) {
-        payout = amount;
+    // Legacy fix for 'win' transactions where payout wasn't stored separately.
+    // Audit verified: legacy 'amount' stores the stake (bet amount).
+    if (o.type === 'win' && (payout === 0 || !o.payout) && amount > 0) {
         const color = (o.userColor || o.winningColor || 'green').toLowerCase();
         const mult = multipliers[color] || 2;
-        amount = payout / mult;
+        payout = amount * mult;
+        // amount remains as stake (bet amount)
     }
 
     let username = o.username || "User";
@@ -325,8 +331,8 @@ const mapTx = t => {
     return {
         ...o,
         id: o._id,
-        amount: amount,
-        payout: payout,
+        amount: amount, // Stake
+        payout: payout, // Total Return
         profit: Math.max(0, payout - amount),
         color: o.userColor || o.winningColor || 'green',
         balanceAfter: (o.balanceAfter || 0) / 100,
@@ -409,7 +415,8 @@ app.get('/top-wins', verifyToken, async (req, res) => {
         const wins = await Transaction.aggregate([
             { $match: { type: 'win', status: 'success' } },
             { $addFields: {
-                // For sorting legacy and new transactions together
+                // For sorting legacy and new transactions together.
+                // We use payout if available, otherwise fallback to amount (stake).
                 sortPayout: { $ifNull: ["$payout", "$amount"] }
             }},
             { $sort: { sortPayout: -1 } },
