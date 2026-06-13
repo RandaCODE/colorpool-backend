@@ -32,9 +32,10 @@ betSchema.index({ roundId: 1, settled: 1 });
 
 const transactionSchema = new mongoose.Schema({
   userId: { type: String, required: true },
+  username: { type: String }, // Added for Top Wins feed
   type: { type: String, required: true },
-  amount: { type: Number, required: true }, // STORED IN KOBO
-  payout: { type: Number, default: 0 },     // STORED IN KOBO
+  amount: { type: Number, required: true }, // STORED IN KOBO (Bet amount for wins, total for others)
+  payout: { type: Number, default: 0 },     // STORED IN KOBO (Total payout for wins)
   balanceAfter: { type: Number },           // STORED IN KOBO
   description: { type: String },
   status: { type: String, enum: ['pending', 'success', 'failed', 'rejected'], default: 'success' },

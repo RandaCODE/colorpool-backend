@@ -238,7 +238,16 @@ async function finalizeRound() {
                 if (isWinner) {
                     const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payoutKobo, "stats.totalWins": 1 } }, { session, new: true });
                     await Transaction.create([{
-                        userId: bet.userId, type: 'win', amount: payoutKobo, status: 'success', roundId, winningColor: winner, userColor: bet.color, balanceAfter: user.balance
+                        userId: bet.userId,
+                        username: bet.username || "User",
+                        type: 'win',
+                        amount: bet.amount, // Store bet amount to calculate multiplier
+                        payout: payoutKobo, // Store total payout
+                        status: 'success',
+                        roundId,
+                        winningColor: winner,
+                        userColor: bet.color,
+                        balanceAfter: user.balance
                     }], { session });
                     io.to(bet.userId).emit("balance_update", { balance: user.balance / 100 });
                 }
@@ -295,9 +304,34 @@ const mapBet = b => {
     const o = b.toObject ? b.toObject() : b;
     return { ...o, id: o._id, amount: o.amount / 100, payout: o.payout / 100 };
 };
+
 const mapTx = t => {
     const o = t.toObject ? t.toObject() : t;
-    return { ...o, id: o._id, amount: o.amount / 100, payout: o.payout / 100, balanceAfter: (o.balanceAfter || 0) / 100 };
+
+    let amount = Math.abs(o.amount || 0) / 100;
+    let payout = (o.payout || 0) / 100;
+
+    // Legacy fix for 'win' transactions where payout wasn't stored separately
+    if (o.type === 'win' && payout === 0 && amount > 0) {
+        payout = amount;
+        const color = (o.userColor || o.winningColor || 'green').toLowerCase();
+        const mult = multipliers[color] || 2;
+        amount = payout / mult;
+    }
+
+    let username = o.username || "User";
+    if (username.includes('@')) username = username.split('@')[0];
+
+    return {
+        ...o,
+        id: o._id,
+        amount: amount,
+        payout: payout,
+        profit: Math.max(0, payout - amount),
+        color: o.userColor || o.winningColor || 'green',
+        balanceAfter: (o.balanceAfter || 0) / 100,
+        username: username
+    };
 };
 
 app.get('/game-state', verifyToken, async (req, res) => {
@@ -320,8 +354,9 @@ app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
             const user = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: kobo } }, { $inc: { balance: -kobo, "stats.totalBets": 1 } }, { session, new: true });
             if (!user) throw new Error("Insufficient funds");
             bal = user.balance;
-            const tx = await Transaction.create([{ userId: req.user.uid, type: 'bet', amount: -kobo, balanceAfter: user.balance, status: 'pending', roundId: game.roundId, userColor: color }], { session });
-            const b = await Bet.create([{ userId: req.user.uid, username: req.user.email?.split('@')[0] || "User", roundId: game.roundId, color, amount: kobo, transactionId: tx[0]._id }], { session });
+            const username = req.user.email?.split('@')[0] || "User";
+            const tx = await Transaction.create([{ userId: req.user.uid, username, type: 'bet', amount: -kobo, balanceAfter: user.balance, status: 'pending', roundId: game.roundId, userColor: color }], { session });
+            const b = await Bet.create([{ userId: req.user.uid, username, roundId: game.roundId, color, amount: kobo, transactionId: tx[0]._id }], { session });
             betObj = b[0];
             await pubClient.hIncrBy(`pools:${game.roundId}`, color, kobo);
         });
@@ -370,8 +405,54 @@ app.get('/all-bets', verifyToken, async (req, res) => {
 });
 
 app.get('/top-wins', verifyToken, async (req, res) => {
-    const wins = await Transaction.find({ type: 'win', status: 'success' }).sort({ amount: -1 }).limit(20);
-    res.json({ success: true, data: wins.map(mapTx) });
+    try {
+        const wins = await Transaction.aggregate([
+            { $match: { type: 'win', status: 'success' } },
+            { $addFields: {
+                // For sorting legacy and new transactions together
+                sortPayout: { $ifNull: ["$payout", "$amount"] }
+            }},
+            { $sort: { sortPayout: -1 } },
+            { $limit: 20 },
+            {
+                $lookup: {
+                    from: 'bets',
+                    let: { uId: "$userId", rId: "$roundId" },
+                    pipeline: [
+                        { $match: { $expr: { $and: [ { $eq: ["$userId", "$$uId"] }, { $eq: ["$roundId", "$$rId"] } ] } } },
+                        { $project: { username: 1 } },
+                        { $limit: 1 }
+                    ],
+                    as: 'betInfo'
+                }
+            },
+            { $unwind: { path: "$betInfo", preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'users',
+                    localField: 'userId',
+                    foreignField: 'userId',
+                    as: 'userInfo'
+                }
+            },
+            { $unwind: { path: "$userInfo", preserveNullAndEmptyArrays: true } },
+            { $addFields: {
+                username: {
+                    $ifNull: [
+                        "$username",
+                        "$betInfo.username",
+                        { $arrayElemAt: [{ $split: ["$userInfo.email", "@"] }, 0] },
+                        "User"
+                    ]
+                }
+            }},
+            { $project: { betInfo: 0, userInfo: 0, sortPayout: 0 } }
+        ]);
+        res.json({ success: true, data: wins.map(mapTx) });
+    } catch (e) {
+        console.error("Top Wins Error:", e);
+        res.status(500).json({ success: false });
+    }
 });
 
 app.get('/transactions', verifyToken, async (req, res) => {
