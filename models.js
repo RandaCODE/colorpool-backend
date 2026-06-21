@@ -8,6 +8,9 @@ const userSchema = new mongoose.Schema({
   lastBonusClaimTime: { type: Date, default: null },
   isFlagged: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
+  lastLogin: { type: Date, default: Date.now },
+  totalDeposited: { type: Number, default: 0 },
+  totalWithdrawn: { type: Number, default: 0 },
   stats: {
     totalBets: { type: Number, default: 0 },
     totalWins: { type: Number, default: 0 }
@@ -77,6 +80,10 @@ const roundSchema = new mongoose.Schema({
     purple: { type: Number, default: 0 },
     blue: { type: Number, default: 0 }
   },
+  totalBets: { type: Number, default: 0 },
+  totalPayout: { type: Number, default: 0 },
+  houseProfit: { type: Number, default: 0 },
+  isForced: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now, index: true }
 });
 

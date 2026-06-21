@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -41,6 +42,11 @@ const pubClient = createClient({ url: REDIS_URL });
 const subClient = pubClient.duplicate();
 const stateSubClient = pubClient.duplicate();
 
+// Error listeners to capture and log any Redis client exceptions
+[pubClient, subClient, stateSubClient].forEach(client => {
+    client.on('error', (err) => console.error("❌ Redis Client Exception:", err));
+});
+
 async function electLeader() {
     const lockKey = 'game_master_lock';
     const ttl = 5000;
@@ -76,12 +82,17 @@ async function initRedis() {
                     game.status = updatedGame.status;
                     game.bettingLocked = updatedGame.bettingLocked;
                     game.winner = updatedGame.winner;
+                    game.forcedWinner = updatedGame.forcedWinner;
+                    game.isForced = updatedGame.isForced;
                 }
             }
         });
         setInterval(electLeader, 2000);
         await electLeader();
-    } catch (e) { console.error("❌ Redis Error:", e.message); }
+    } catch (e) {
+        console.error("❌ Redis Initialization Failed. Full Details:");
+        console.error(e); // This now prints the complete Redis exception object
+    }
 }
 initRedis();
 
@@ -108,6 +119,9 @@ const io = new Server(server, {
     pingTimeout: 60000,
     adapter: createAdapter(pubClient, subClient)
 });
+
+// Admin Namespace
+const adminIo = io.of("/admin");
 
 // =======================
 // JOI VALIDATION
@@ -162,10 +176,28 @@ io.use(async (socket, next) => {
     }
 });
 
+adminIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return next(new Error("Forbidden"));
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
 io.on("connection", async (socket) => {
     if (socket.userId) socket.join(socket.userId);
     const response = await getGameResponse();
     socket.emit("game_update", response);
+});
+
+adminIo.on("connection", async (socket) => {
+    const response = await getGameResponse();
+    const analytics = await getAdminAnalytics();
+    socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
 });
 
 // =======================
@@ -179,6 +211,18 @@ async function verifyToken(req, res, next) {
         const authHeader = req.headers.authorization;
         if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
         const decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+        req.user = decodedToken;
+        next();
+    } catch (error) { return res.status(401).json({ success: false, error: 'Invalid session' }); }
+}
+
+async function verifyAdmin(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
+        const decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return res.status(403).json({ success: false, error: 'Forbidden' });
         req.user = decodedToken;
         next();
     } catch (error) { return res.status(401).json({ success: false, error: 'Invalid session' }); }
@@ -200,7 +244,9 @@ let game = {
     winner: null,
     serverSeed: null,
     serverSeedHash: null,
-    clientSeed: `CLIENT_${Date.now()}`
+    clientSeed: `CLIENT_${Date.now()}`,
+    forcedWinner: null,
+    isForced: false
 };
 
 async function getRedisPools(roundId) {
@@ -214,8 +260,30 @@ async function getRedisPools(roundId) {
 
 async function getGameResponse() {
     const pools = await getRedisPools(game.roundId);
-    const { serverSeed, ...sanitized } = game;
+    const { serverSeed, forcedWinner, ...sanitized } = game;
     return { ...sanitized, pools };
+}
+
+async function getAdminAnalytics() {
+    const pools = await getRedisPools(game.roundId);
+    const greenKobo = Math.floor(pools.green * 100);
+    const purpleKobo = Math.floor(pools.purple * 100);
+    const blueKobo = Math.floor(pools.blue * 100);
+    const totalPool = greenKobo + purpleKobo + blueKobo;
+
+    const liabilities = {
+        green: greenKobo * multipliers.green,
+        purple: purpleKobo * multipliers.purple,
+        blue: blueKobo * multipliers.blue
+    };
+
+    const exposure = {
+        green: liabilities.green - totalPool,
+        purple: liabilities.purple - totalPool,
+        blue: liabilities.blue - totalPool
+    };
+
+    return { pools, liabilities, exposure, totalPoolKobo: totalPool };
 }
 
 async function finalizeRound() {
@@ -226,12 +294,15 @@ async function finalizeRound() {
         await session.withTransaction(async () => {
             if (await Round.findOne({ roundId }).session(session)) return;
             const pools = await getRedisPools(roundId);
-            await Round.create([{ ...game, pools }], { session });
+
+            let totalBetsKobo = Math.floor((pools.green + pools.purple + pools.blue) * 100);
+            let totalPayoutKobo = 0;
 
             const bets = await Bet.find({ roundId, settled: false }).session(session);
             for (const bet of bets) {
                 const isWinner = bet.color.toLowerCase() === winner.toLowerCase();
                 const payoutKobo = isWinner ? bet.amount * multipliers[winner] : 0;
+                totalPayoutKobo += payoutKobo;
 
                 await Bet.updateOne({ _id: bet._id }, { $set: { settled: true, result: isWinner ? "WON" : "LOST", payout: payoutKobo } }).session(session);
 
@@ -241,8 +312,8 @@ async function finalizeRound() {
                         userId: bet.userId,
                         username: bet.username || "User",
                         type: 'win',
-                        amount: bet.amount, // Store bet amount to calculate multiplier
-                        payout: payoutKobo, // Store total payout
+                        amount: bet.amount,
+                        payout: payoutKobo,
                         status: 'success',
                         roundId,
                         winningColor: winner,
@@ -255,8 +326,19 @@ async function finalizeRound() {
                     await Transaction.updateOne({ _id: bet.transactionId }, { $set: { status: 'success', winningColor: winner, payout: payoutKobo } }).session(session);
                 }
             }
+
+            const houseProfitKobo = totalBetsKobo - totalPayoutKobo;
+            await Round.create([{
+                ...game,
+                pools,
+                totalBets: totalBetsKobo,
+                totalPayout: totalPayoutKobo,
+                houseProfit: houseProfitKobo,
+                isForced: game.isForced || false
+            }], { session });
         });
         io.emit("transaction_update");
+        adminIo.emit("stats_update");
     } catch (e) { console.error("❌ Finalize Error:", e.message); } finally { session.endSession(); }
 }
 
@@ -272,10 +354,18 @@ function startGameLoop() {
         if (game.time === LOCK_AT) {
             game.bettingLocked = true;
             game.status = "locked";
-            const combined = `${game.serverSeed}:${game.clientSeed}:${game.roundId}`;
-            const hash = crypto.createHash('sha256').update(combined).digest('hex');
-            const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
-            game.winner = num < 0.485 ? "green" : (num < 0.808 ? "purple" : "blue");
+
+            if (game.forcedWinner) {
+                game.winner = game.forcedWinner;
+                game.isForced = true;
+                game.forcedWinner = null;
+            } else {
+                const combined = `${game.serverSeed}:${game.clientSeed}:${game.roundId}`;
+                const hash = crypto.createHash('sha256').update(combined).digest('hex');
+                const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
+                game.winner = num < 0.485 ? "green" : (num < 0.808 ? "purple" : "blue");
+                game.isForced = false;
+            }
         }
         if (game.time === RESULT_AT) {
             game.status = "result";
@@ -287,12 +377,16 @@ function startGameLoop() {
                 roundId: `R-${Date.now()}`,
                 time: ROUND_TIME, status: "betting", bettingLocked: false,
                 winner: null, serverSeed: null, serverSeedHash: null,
-                clientSeed: `CLIENT_${Date.now()}`
+                clientSeed: `CLIENT_${Date.now()}`,
+                forcedWinner: null, isForced: false
             };
         }
         await pubClient.publish('game_state_updates', JSON.stringify(game));
         const response = await getGameResponse();
         io.emit("game_update", response);
+
+        const analytics = await getAdminAnalytics();
+        adminIo.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
     }, 1000);
 }
 
@@ -305,34 +399,22 @@ const mapBet = b => {
     return { ...o, id: o._id, amount: o.amount / 100, payout: o.payout / 100 };
 };
 
-/**
- * Maps transaction object for API consumption.
- * Ensures 'amount' represents the stake and 'payout' represents the total return.
- * Implements legacy reconstruction for older records.
- */
 const mapTx = t => {
     const o = t.toObject ? t.toObject() : t;
-
-    let amount = Math.abs(o.amount || 0) / 100; // Stake
-    let payout = (o.payout || 0) / 100;         // Total Return
-
-    // Legacy fix for 'win' transactions where payout wasn't stored separately.
-    // Audit verified: legacy 'amount' stores the stake (bet amount).
+    let amount = Math.abs(o.amount || 0) / 100;
+    let payout = (o.payout || 0) / 100;
     if (o.type === 'win' && (payout === 0 || !o.payout) && amount > 0) {
         const color = (o.userColor || o.winningColor || 'green').toLowerCase();
         const mult = multipliers[color] || 2;
         payout = amount * mult;
-        // amount remains as stake (bet amount)
     }
-
     let username = o.username || "User";
     if (username.includes('@')) username = username.split('@')[0];
-
     return {
         ...o,
         id: o._id,
-        amount: amount, // Stake
-        payout: payout, // Total Return
+        amount: amount,
+        payout: payout,
         profit: Math.max(0, payout - amount),
         color: o.userColor || o.winningColor || 'green',
         balanceAfter: (o.balanceAfter || 0) / 100,
@@ -342,7 +424,15 @@ const mapTx = t => {
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
-        const user = await User.findOne({ userId: req.user.uid }) || await User.create({ userId: req.user.uid, balance: 100000 });
+        const user = await User.findOneAndUpdate(
+            { userId: req.user.uid },
+            { $set: { lastLogin: new Date() } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        if (!user.balance && user.balance !== 0 && user.stats.totalBets === 0) {
+            user.balance = 100000;
+            await user.save();
+        }
         const history = await Round.find().sort({ createdAt: -1 }).limit(20);
         const response = await getGameResponse();
         res.json({ success: true, data: { ...response, balance: user.balance / 100, colorHistory: history.map(r => r.winner), playStreak: user.playStreak, canClaimBonus: !user.lastBonusClaimTime || (new Date() - user.lastBonusClaimTime > 86400000) } });
@@ -390,7 +480,7 @@ app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
                 await session.withTransaction(async () => {
                     const ex = await Transaction.findOne({ reference: req.params.reference }).session(session);
                     if (ex) { bal = (await User.findOne({ userId }).session(session)).balance; return; }
-                    const u = await User.findOneAndUpdate({ userId }, { $inc: { balance: amount } }, { session, new: true });
+                    const u = await User.findOneAndUpdate({ userId }, { $inc: { balance: amount, totalDeposited: amount } }, { session, new: true });
                     bal = u.balance;
                     await Transaction.create([{ userId, type: 'deposit', amount, balanceAfter: u.balance, status: 'success', reference: req.params.reference }], { session });
                 });
@@ -414,11 +504,7 @@ app.get('/top-wins', verifyToken, async (req, res) => {
     try {
         const wins = await Transaction.aggregate([
             { $match: { type: 'win', status: 'success' } },
-            { $addFields: {
-                // For sorting legacy and new transactions together.
-                // We use payout if available, otherwise fallback to amount (stake).
-                sortPayout: { $ifNull: ["$payout", "$amount"] }
-            }},
+            { $addFields: { sortPayout: { $ifNull: ["$payout", "$amount"] } }},
             { $sort: { sortPayout: -1 } },
             { $limit: 20 },
             {
@@ -456,10 +542,7 @@ app.get('/top-wins', verifyToken, async (req, res) => {
             { $project: { betInfo: 0, userInfo: 0, sortPayout: 0 } }
         ]);
         res.json({ success: true, data: wins.map(mapTx) });
-    } catch (e) {
-        console.error("Top Wins Error:", e);
-        res.status(500).json({ success: false });
-    }
+    } catch (e) { res.status(500).json({ success: false }); }
 });
 
 app.get('/transactions', verifyToken, async (req, res) => {
@@ -501,6 +584,89 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
         });
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+// =======================
+// ADMIN ROUTES
+// =======================
+
+app.get('/admin/verify', verifyAdmin, (req, res) => res.json({ success: true }));
+
+app.get('/admin/stats', verifyAdmin, async (req, res) => {
+    try {
+        const totalUsers = await User.countDocuments();
+        const stats = await Round.aggregate([
+            { $group: {
+                _id: null,
+                totalBets: { $sum: "$totalBets" },
+                totalPayout: { $sum: "$totalPayout" },
+                totalProfit: { $sum: "$houseProfit" },
+                count: { $sum: 1 }
+            }}
+        ]);
+        const dailyStats = await Round.aggregate([
+            { $match: { createdAt: { $gte: new Date(Date.now() - 86400000) } } },
+            { $group: {
+                _id: null,
+                totalBets: { $sum: "$totalBets" },
+                totalPayout: { $sum: "$totalPayout" },
+                totalProfit: { $sum: "$houseProfit" }
+            }}
+        ]);
+        res.json({
+            success: true,
+            data: {
+                totalUsers,
+                overall: stats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 },
+                daily: dailyStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0 }
+            }
+        });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/force-winner', verifyAdmin, async (req, res) => {
+    const { color } = req.body;
+    if (!['green', 'purple', 'blue'].includes(color)) return res.status(400).json({ success: false, error: "Invalid color" });
+    game.forcedWinner = color;
+    res.json({ success: true, message: `Forced winner set to ${color}` });
+});
+
+app.get('/admin/withdrawals', verifyAdmin, async (req, res) => {
+    try {
+        const withdrawals = await Transaction.find({ type: 'withdrawal', status: 'pending' }).sort({ createdAt: -1 });
+        res.json({ success: true, data: withdrawals.map(mapTx) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/withdrawal-action', verifyAdmin, validate(schemas.adminAction), async (req, res) => {
+    const { transactionId, action, notes } = req.body;
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            const tx = await Transaction.findById(transactionId).session(session);
+            if (!tx || tx.type !== 'withdrawal' || tx.status !== 'pending') throw new Error("Invalid transaction");
+
+            if (action === 'approve') {
+                tx.status = 'success';
+                await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { totalWithdrawn: Math.abs(tx.amount) } }, { session });
+            } else {
+                tx.status = 'rejected';
+                const u = await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { balance: Math.abs(tx.amount) } }, { session, new: true });
+                await Transaction.create([{ userId: tx.userId, type: 'refund', amount: Math.abs(tx.amount), balanceAfter: u.balance, status: 'success', description: `Refund: Rejected withdrawal` }], { session });
+            }
+            tx.adminNotes = notes;
+            tx.processedBy = req.user.uid;
+            await tx.save({ session });
+        });
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+app.get('/admin/users', verifyAdmin, async (req, res) => {
+    try {
+        const users = await User.find().sort({ lastLogin: -1 }).limit(100);
+        res.json({ success: true, data: users });
+    } catch (e) { res.status(500).json({ success: false }); }
 });
 
 if (MONGO_URI) mongoose.connect(MONGO_URI).then(() => { console.log("✅ DB Connected"); startGameLoop(); });
