@@ -91,7 +91,7 @@ async function initRedis() {
         await electLeader();
     } catch (e) {
         console.error("❌ Redis Initialization Failed. Full Details:");
-        console.error(e); // This now prints the complete Redis exception object
+        console.error(e);
     }
 }
 initRedis();
@@ -148,6 +148,11 @@ const schemas = {
         transactionId: Joi.string().required(),
         action: Joi.string().valid('approve', 'reject').required(),
         notes: Joi.string().allow('').max(500)
+    }),
+    adjustBalance: Joi.object({
+        userId: Joi.string().required(),
+        amount: Joi.number().required(),
+        reason: Joi.string().required().max(100)
     })
 };
 
@@ -339,6 +344,7 @@ async function finalizeRound() {
         });
         io.emit("transaction_update");
         adminIo.emit("stats_update");
+        adminIo.emit("transaction_update");
     } catch (e) { console.error("❌ Finalize Error:", e.message); } finally { session.endSession(); }
 }
 
@@ -391,7 +397,7 @@ function startGameLoop() {
 }
 
 // =======================
-// ROUTES
+// UTILS & MAPPING
 // =======================
 
 const mapBet = b => {
@@ -421,6 +427,10 @@ const mapTx = t => {
         username: username
     };
 };
+
+// =======================
+// ROUTES
+// =======================
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
@@ -456,7 +466,9 @@ app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
             betObj = b[0];
             await pubClient.hIncrBy(`pools:${game.roundId}`, color, kobo);
         });
-        io.emit("new_bet", mapBet(betObj));
+        const mapped = mapBet(betObj);
+        io.emit("new_bet", mapped);
+        adminIo.emit("new_bet", mapped);
         res.json({ success: true, data: { balance: bal / 100 } });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -577,11 +589,14 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
     const kobo = Math.floor(req.body.amount * 100);
     const session = await mongoose.startSession();
     try {
+        let tx = null;
         await session.withTransaction(async () => {
             const u = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: kobo } }, { $inc: { balance: -kobo } }, { session, new: true });
             if (!u) throw new Error("Insufficient funds");
-            await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body.bankDetails }], { session });
+            const resTx = await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body.bankDetails }], { session });
+            tx = resTx[0];
         });
+        adminIo.emit("new_withdrawal", mapTx(tx));
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -594,8 +609,21 @@ app.get('/admin/verify', verifyAdmin, (req, res) => res.json({ success: true }))
 
 app.get('/admin/stats', verifyAdmin, async (req, res) => {
     try {
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
         const totalUsers = await User.countDocuments();
-        const stats = await Round.aggregate([
+        const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
+        const onlineUsers = io.sockets.sockets.size;
+
+        const financialStats = await Transaction.aggregate([
+            { $match: { status: 'success' } },
+            { $group: {
+                _id: null,
+                totalDeposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
+                totalWithdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
+            }}
+        ]);
+
+        const gameStats = await Round.aggregate([
             { $group: {
                 _id: null,
                 totalBets: { $sum: "$totalBets" },
@@ -604,23 +632,68 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
                 count: { $sum: 1 }
             }}
         ]);
-        const dailyStats = await Round.aggregate([
-            { $match: { createdAt: { $gte: new Date(Date.now() - 86400000) } } },
-            { $group: {
-                _id: null,
-                totalBets: { $sum: "$totalBets" },
-                totalPayout: { $sum: "$totalPayout" },
-                totalProfit: { $sum: "$houseProfit" }
-            }}
-        ]);
+
+        const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0 };
+        const gme = gameStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 };
+
         res.json({
             success: true,
             data: {
-                totalUsers,
-                overall: stats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 },
-                daily: dailyStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0 }
+                totalUsers, newUsersToday, onlineUsers,
+                totalDeposits: fin.totalDeposits / 100,
+                totalWithdrawals: fin.totalWithdrawals / 100,
+                totalBets: gme.totalBets / 100,
+                totalPayout: gme.totalPayout / 100,
+                houseProfit: gme.totalProfit / 100,
+                totalRounds: gme.count
             }
         });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/analytics', verifyAdmin, async (req, res) => {
+    try {
+        const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        const profitTrends = await Round.aggregate([
+            { $match: { createdAt: { $gte: sevenDaysAgo } } },
+            { $group: {
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                profit: { $sum: "$houseProfit" },
+                volume: { $sum: "$totalBets" }
+            }},
+            { $sort: { "_id": 1 } }
+        ]);
+
+        const financeTrends = await Transaction.aggregate([
+            { $match: { status: 'success', createdAt: { $gte: sevenDaysAgo }, type: { $in: ['deposit', 'withdrawal'] } } },
+            { $group: {
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                deposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
+                withdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
+            }},
+            { $sort: { "_id": 1 } }
+        ]);
+
+        res.json({
+            success: true,
+            data: {
+                profitTrends: profitTrends.map(t => ({ date: t._id, profit: t.profit / 100, volume: t.volume / 100 })),
+                financeTrends: financeTrends.map(t => ({ date: t._id, deposits: t.deposits / 100, withdrawals: t.withdrawals / 100 }))
+            }
+        });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/round-analytics', verifyAdmin, async (req, res) => {
+    try {
+        const colorDistribution = await Round.aggregate([
+            { $group: {
+                _id: "$winner",
+                count: { $sum: 1 },
+                totalProfit: { $sum: "$houseProfit" }
+            }}
+        ]);
+        res.json({ success: true, data: colorDistribution.map(d => ({ color: d._id, count: d.count, profit: d.totalProfit / 100 })) });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
@@ -664,8 +737,68 @@ app.post('/admin/withdrawal-action', verifyAdmin, validate(schemas.adminAction),
 
 app.get('/admin/users', verifyAdmin, async (req, res) => {
     try {
-        const users = await User.find().sort({ lastLogin: -1 }).limit(100);
-        res.json({ success: true, data: users });
+        const { search, page = 1, limit = 50 } = req.query;
+        let query = {};
+        if (search) {
+            query = { $or: [ { userId: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } } ] };
+        }
+        const users = await User.find(query).sort({ lastLogin: -1 }).limit(limit * 1).skip((page - 1) * limit);
+        const count = await User.countDocuments(query);
+        res.json({ success: true, data: { users, totalPages: Math.ceil(count / limit), currentPage: page, totalUsers: count } });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
+    try {
+        const user = await User.findOne({ userId: req.params.userId });
+        if (!user) return res.status(404).json({ success: false });
+        const recentBets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
+        const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
+        res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/user/toggle-flag', verifyAdmin, async (req, res) => {
+    try {
+        const user = await User.findOne({ userId: req.body.userId });
+        if (!user) return res.status(404).json({ success: false });
+        user.isFlagged = !user.isFlagged;
+        await user.save();
+        res.json({ success: true, isFlagged: user.isFlagged });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/user/adjust-balance', verifyAdmin, validate(schemas.adjustBalance), async (req, res) => {
+    const kobo = Math.floor(req.body.amount * 100);
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            const user = await User.findOneAndUpdate({ userId: req.body.userId }, { $inc: { balance: kobo } }, { session, new: true });
+            if (!user) throw new Error("User not found");
+            await Transaction.create([{ userId: req.body.userId, type: kobo > 0 ? 'bonus' : 'adjustment', amount: kobo, balanceAfter: user.balance, description: `Admin Adjustment: ${req.body.reason}`, processedBy: req.user.uid }], { session });
+            io.to(req.body.userId).emit("balance_update", { balance: user.balance / 100 });
+        });
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+app.get('/admin/transactions', verifyAdmin, async (req, res) => {
+    try {
+        const { type, status, userId, page = 1, limit = 50 } = req.query;
+        let query = {};
+        if (type) query.type = type;
+        if (status) query.status = status;
+        if (userId) query.userId = userId;
+
+        const transactions = await Transaction.find(query).sort({ createdAt: -1 }).limit(limit * 1).skip((page - 1) * limit);
+        res.json({ success: true, data: transactions.map(mapTx) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/rounds', verifyAdmin, async (req, res) => {
+    try {
+        const rounds = await Round.find().sort({ createdAt: -1 }).limit(20).skip(((req.query.page || 1) - 1) * 20);
+        res.json({ success: true, data: rounds });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 

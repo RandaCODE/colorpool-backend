@@ -14,7 +14,8 @@ const userSchema = new mongoose.Schema({
   stats: {
     totalBets: { type: Number, default: 0 },
     totalWins: { type: Number, default: 0 }
-  }
+  },
+  createdAt: { type: Date, default: Date.now } // Added for Admin "New Users Today"
 });
 
 const betSchema = new mongoose.Schema({
