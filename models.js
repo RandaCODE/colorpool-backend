@@ -88,6 +88,20 @@ const roundSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, index: true }
 });
 
+const roundHistorySchema = new mongoose.Schema({
+  roundId: { type: String, unique: true, index: true },
+  winningColor: String,
+  totalPool: Number, // KOBO
+  greenPool: Number, // KOBO
+  purplePool: Number, // KOBO
+  bluePool: Number, // KOBO
+  payoutAmount: Number, // KOBO
+  houseProfit: Number, // KOBO
+  forcedWinner: String,
+  forcedBy: String, // Admin UID
+  timestamp: { type: Date, default: Date.now, index: true }
+});
+
 const globalStateSchema = new mongoose.Schema({
     key: { type: String, default: "current" },
     roundId: String,
@@ -111,5 +125,6 @@ module.exports = {
   Transaction: mongoose.model('Transaction', transactionSchema),
   WebhookEvent: mongoose.model('WebhookEvent', webhookEventSchema),
   GlobalState: mongoose.model('GlobalState', globalStateSchema),
-  Round: mongoose.model('Round', roundSchema)
+  Round: mongoose.model('Round', roundSchema),
+  RoundHistory: mongoose.model('RoundHistory', roundHistorySchema)
 };

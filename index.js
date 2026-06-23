@@ -12,7 +12,7 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
-const { User, Bet, Transaction, GlobalState, Round, WebhookEvent } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round, WebhookEvent, RoundHistory } = require("./models");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -83,6 +83,7 @@ async function initRedis() {
                     game.bettingLocked = updatedGame.bettingLocked;
                     game.winner = updatedGame.winner;
                     game.forcedWinner = updatedGame.forcedWinner;
+                    game.forcedBy = updatedGame.forcedBy;
                     game.isForced = updatedGame.isForced;
                 }
             }
@@ -251,6 +252,7 @@ let game = {
     serverSeedHash: null,
     clientSeed: `CLIENT_${Date.now()}`,
     forcedWinner: null,
+    forcedBy: null,
     isForced: false
 };
 
@@ -265,7 +267,7 @@ async function getRedisPools(roundId) {
 
 async function getGameResponse() {
     const pools = await getRedisPools(game.roundId);
-    const { serverSeed, forcedWinner, ...sanitized } = game;
+    const { serverSeed, forcedWinner, forcedBy, ...sanitized } = game;
     return { ...sanitized, pools };
 }
 
@@ -341,10 +343,26 @@ async function finalizeRound() {
                 houseProfit: houseProfitKobo,
                 isForced: game.isForced || false
             }], { session });
+
+            // Audit History Layer
+            await RoundHistory.create([{
+                roundId: roundId,
+                winningColor: winner,
+                totalPool: totalBetsKobo,
+                greenPool: Math.floor(pools.green * 100),
+                purplePool: Math.floor(pools.purple * 100),
+                bluePool: Math.floor(pools.blue * 100),
+                payoutAmount: totalPayoutKobo,
+                houseProfit: houseProfitKobo,
+                forcedWinner: game.isForced ? winner : null,
+                forcedBy: game.forcedBy,
+                timestamp: new Date()
+            }], { session });
         });
         io.emit("transaction_update");
         adminIo.emit("stats_update");
         adminIo.emit("transaction_update");
+        adminIo.emit("round_history_update");
     } catch (e) { console.error("❌ Finalize Error:", e.message); } finally { session.endSession(); }
 }
 
@@ -364,6 +382,7 @@ function startGameLoop() {
             if (game.forcedWinner) {
                 game.winner = game.forcedWinner;
                 game.isForced = true;
+                // forcedBy remains set from the admin action
                 game.forcedWinner = null;
             } else {
                 const combined = `${game.serverSeed}:${game.clientSeed}:${game.roundId}`;
@@ -371,6 +390,7 @@ function startGameLoop() {
                 const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
                 game.winner = num < 0.485 ? "green" : (num < 0.808 ? "purple" : "blue");
                 game.isForced = false;
+                game.forcedBy = null;
             }
         }
         if (game.time === RESULT_AT) {
@@ -384,7 +404,7 @@ function startGameLoop() {
                 time: ROUND_TIME, status: "betting", bettingLocked: false,
                 winner: null, serverSeed: null, serverSeedHash: null,
                 clientSeed: `CLIENT_${Date.now()}`,
-                forcedWinner: null, isForced: false
+                forcedWinner: null, forcedBy: null, isForced: false
             };
         }
         await pubClient.publish('game_state_updates', JSON.stringify(game));
@@ -620,7 +640,7 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
                 _id: null,
                 totalDeposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
                 totalWithdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
-            }}
+            } }
         ]);
 
         const gameStats = await Round.aggregate([
@@ -630,7 +650,7 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
                 totalPayout: { $sum: "$totalPayout" },
                 totalProfit: { $sum: "$houseProfit" },
                 count: { $sum: 1 }
-            }}
+            } }
         ]);
 
         const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0 };
@@ -660,7 +680,7 @@ app.get('/admin/analytics', verifyAdmin, async (req, res) => {
                 _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
                 profit: { $sum: "$houseProfit" },
                 volume: { $sum: "$totalBets" }
-            }},
+            } },
             { $sort: { "_id": 1 } }
         ]);
 
@@ -670,7 +690,7 @@ app.get('/admin/analytics', verifyAdmin, async (req, res) => {
                 _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
                 deposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
                 withdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
-            }},
+            } },
             { $sort: { "_id": 1 } }
         ]);
 
@@ -691,7 +711,7 @@ app.get('/admin/round-analytics', verifyAdmin, async (req, res) => {
                 _id: "$winner",
                 count: { $sum: 1 },
                 totalProfit: { $sum: "$houseProfit" }
-            }}
+            } }
         ]);
         res.json({ success: true, data: colorDistribution.map(d => ({ color: d._id, count: d.count, profit: d.totalProfit / 100 })) });
     } catch (e) { res.status(500).json({ success: false }); }
@@ -701,6 +721,7 @@ app.post('/admin/force-winner', verifyAdmin, async (req, res) => {
     const { color } = req.body;
     if (!['green', 'purple', 'blue'].includes(color)) return res.status(400).json({ success: false, error: "Invalid color" });
     game.forcedWinner = color;
+    game.forcedBy = req.user.uid;
     res.json({ success: true, message: `Forced winner set to ${color}` });
 });
 
@@ -799,6 +820,34 @@ app.get('/admin/rounds', verifyAdmin, async (req, res) => {
     try {
         const rounds = await Round.find().sort({ createdAt: -1 }).limit(20).skip(((req.query.page || 1) - 1) * 20);
         res.json({ success: true, data: rounds });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/round-history', verifyAdmin, async (req, res) => {
+    try {
+        const { page = 1, limit = 20 } = req.query;
+        const history = await RoundHistory.find()
+            .sort({ timestamp: -1 })
+            .limit(limit * 1)
+            .skip((page - 1) * limit);
+        const count = await RoundHistory.countDocuments();
+        res.json({
+            success: true,
+            data: {
+                history: history.map(h => ({
+                    ...h.toObject(),
+                    totalPool: h.totalPool / 100,
+                    greenPool: h.greenPool / 100,
+                    purplePool: h.purplePool / 100,
+                    bluePool: h.bluePool / 100,
+                    payoutAmount: h.payoutAmount / 100,
+                    houseProfit: h.houseProfit / 100
+                })),
+                totalPages: Math.ceil(count / limit),
+                currentPage: page,
+                totalRounds: count
+            }
+        });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
