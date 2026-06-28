@@ -12,7 +12,7 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
-const { User, Bet, Transaction, GlobalState, Round, WebhookEvent, RoundHistory } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round } = require("./models");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -85,6 +85,8 @@ async function initRedis() {
                     game.forcedWinner = updatedGame.forcedWinner;
                     game.forcedBy = updatedGame.forcedBy;
                     game.isForced = updatedGame.isForced;
+                    game.timeline = updatedGame.timeline;
+                    game.riskSnapshot = updatedGame.riskSnapshot;
                 }
             }
         });
@@ -253,7 +255,11 @@ let game = {
     clientSeed: `CLIENT_${Date.now()}`,
     forcedWinner: null,
     forcedBy: null,
-    isForced: false
+    forcedAt: null,
+    forcedReason: null,
+    isForced: false,
+    timeline: { startedAt: new Date(), lockedAt: null, resultAt: null, completedAt: null },
+    riskSnapshot: null
 };
 
 async function getRedisPools(roundId) {
@@ -305,9 +311,21 @@ async function finalizeRound() {
             let totalBetsKobo = Math.floor((pools.green + pools.purple + pools.blue) * 100);
             let totalPayoutKobo = 0;
 
+            const colorStats = {
+                green: { players: 0, amount: 0 },
+                purple: { players: 0, amount: 0 },
+                blue: { players: 0, amount: 0 }
+            };
+            const winningPlayers = [];
+            const losingPlayers = [];
+
             const bets = await Bet.find({ roundId, settled: false }).session(session);
             for (const bet of bets) {
-                const isWinner = bet.color.toLowerCase() === winner.toLowerCase();
+                const color = bet.color.toLowerCase();
+                colorStats[color].players += 1;
+                colorStats[color].amount += bet.amount;
+
+                const isWinner = color === winner.toLowerCase();
                 const payoutKobo = isWinner ? bet.amount * multipliers[winner] : 0;
                 totalPayoutKobo += payoutKobo;
 
@@ -327,7 +345,10 @@ async function finalizeRound() {
                         userColor: bet.color,
                         balanceAfter: user.balance
                     }], { session });
+                    winningPlayers.push({ username: bet.username, userId: bet.userId, betAmount: bet.amount, winningAmount: payoutKobo });
                     io.to(bet.userId).emit("balance_update", { balance: user.balance / 100 });
+                } else {
+                    losingPlayers.push({ username: bet.username, userId: bet.userId, color: bet.color, betAmount: bet.amount });
                 }
                 if (bet.transactionId) {
                     await Transaction.updateOne({ _id: bet.transactionId }, { $set: { status: 'success', winningColor: winner, payout: payoutKobo } }).session(session);
@@ -335,27 +356,27 @@ async function finalizeRound() {
             }
 
             const houseProfitKobo = totalBetsKobo - totalPayoutKobo;
+            const houseEdge = totalBetsKobo > 0 ? ((totalBetsKobo - totalPayoutKobo) / totalBetsKobo) * 100 : 0;
+            game.timeline.completedAt = new Date();
+
             await Round.create([{
                 ...game,
-                pools,
-                totalBets: totalBetsKobo,
-                totalPayout: totalPayoutKobo,
-                houseProfit: houseProfitKobo,
-                isForced: game.isForced || false
-            }], { session });
-
-            // Audit History Layer
-            await RoundHistory.create([{
-                roundId: roundId,
                 winningColor: winner,
                 totalPool: totalBetsKobo,
                 greenPool: Math.floor(pools.green * 100),
                 purplePool: Math.floor(pools.purple * 100),
                 bluePool: Math.floor(pools.blue * 100),
-                payoutAmount: totalPayoutKobo,
+                totalBets: totalBetsKobo,
+                totalPayout: totalPayoutKobo,
                 houseProfit: houseProfitKobo,
-                forcedWinner: game.isForced ? winner : null,
-                forcedBy: game.forcedBy,
+                houseEdge: houseEdge,
+                isForced: game.isForced || false,
+                playerCount: bets.length,
+                colorStats,
+                winningPlayers,
+                losingPlayers,
+                timeline: game.timeline,
+                riskSnapshot: game.riskSnapshot,
                 timestamp: new Date()
             }], { session });
         });
@@ -378,11 +399,19 @@ function startGameLoop() {
         if (game.time === LOCK_AT) {
             game.bettingLocked = true;
             game.status = "locked";
+            game.timeline.lockedAt = new Date();
+
+            const analytics = await getAdminAnalytics();
+            game.riskSnapshot = {
+                green: analytics.exposure.green,
+                purple: analytics.exposure.purple,
+                blue: analytics.exposure.blue
+            };
 
             if (game.forcedWinner) {
                 game.winner = game.forcedWinner;
                 game.isForced = true;
-                // forcedBy remains set from the admin action
+                // game.forcedAt, forcedBy, forcedReason already set at trigger
                 game.forcedWinner = null;
             } else {
                 const combined = `${game.serverSeed}:${game.clientSeed}:${game.roundId}`;
@@ -395,6 +424,7 @@ function startGameLoop() {
         }
         if (game.time === RESULT_AT) {
             game.status = "result";
+            game.timeline.resultAt = new Date();
             io.emit("round_result", { winner: game.winner });
             finalizeRound();
         }
@@ -404,7 +434,9 @@ function startGameLoop() {
                 time: ROUND_TIME, status: "betting", bettingLocked: false,
                 winner: null, serverSeed: null, serverSeedHash: null,
                 clientSeed: `CLIENT_${Date.now()}`,
-                forcedWinner: null, forcedBy: null, isForced: false
+                forcedWinner: null, forcedBy: null, forcedAt: null, forcedReason: null, isForced: false,
+                timeline: { startedAt: new Date(), lockedAt: null, resultAt: null, completedAt: null },
+                riskSnapshot: null
             };
         }
         await pubClient.publish('game_state_updates', JSON.stringify(game));
@@ -489,6 +521,7 @@ app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
         const mapped = mapBet(betObj);
         io.emit("new_bet", mapped);
         adminIo.emit("new_bet", mapped);
+        adminIo.emit("stats_update");
         res.json({ success: true, data: { balance: bal / 100 } });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -516,6 +549,7 @@ app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
                     bal = u.balance;
                     await Transaction.create([{ userId, type: 'deposit', amount, balanceAfter: u.balance, status: 'success', reference: req.params.reference }], { session });
                 });
+                adminIo.emit("stats_update");
                 res.json({ success: true, data: { balance: bal / 100 } });
             } finally { session.endSession(); }
         } else res.status(400).json({ success: false });
@@ -601,6 +635,7 @@ app.post('/claim-bonus', verifyToken, async (req, res) => {
             bal = u.balance;
             await Transaction.create([{ userId: req.user.uid, type: 'bonus', amount: 10000, balanceAfter: u.balance }], { session });
         });
+        adminIo.emit("stats_update");
         res.json({ success: true, data: { balance: bal / 100 } });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -617,6 +652,7 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
             tx = resTx[0];
         });
         adminIo.emit("new_withdrawal", mapTx(tx));
+        adminIo.emit("stats_update");
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -634,27 +670,43 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
         const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
         const onlineUsers = io.sockets.sockets.size;
 
+        // Current Wallet Liability (Sum of all user balances)
+        const userStats = await User.aggregate([{ $group: { _id: null, totalLiability: { $sum: "$balance" } } }]);
+        const currentWalletLiability = (userStats[0]?.totalLiability || 0) / 100;
+
         const financialStats = await Transaction.aggregate([
             { $match: { status: 'success' } },
             { $group: {
                 _id: null,
                 totalDeposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
-                totalWithdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
+                totalWithdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } },
+                todayDeposits: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "deposit"] }, { $gte: ["$createdAt", startOfToday] }] }, "$amount", 0] } },
+                todayWithdrawals: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "withdrawal"] }, { $gte: ["$createdAt", startOfToday] }] }, { $abs: "$amount" }, 0] } }
             } }
         ]);
+
+        const pendingWithdrawalLiabilityAgg = await Transaction.aggregate([
+            { $match: { type: 'withdrawal', status: 'pending' } },
+            { $group: { _id: null, total: { $sum: { $abs: "$amount" } } } }
+        ]);
+        const pendingWithdrawalLiability = (pendingWithdrawalLiabilityAgg[0]?.total || 0) / 100;
 
         const gameStats = await Round.aggregate([
             { $group: {
                 _id: null,
-                totalBets: { $sum: "$totalBets" },
+                totalBets: { $sum: "$totalPool" },
                 totalPayout: { $sum: "$totalPayout" },
                 totalProfit: { $sum: "$houseProfit" },
                 count: { $sum: 1 }
             } }
         ]);
 
-        const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0 };
+        const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0, todayDeposits: 0, todayWithdrawals: 0 };
         const gme = gameStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 };
+
+        const todayDeposits = fin.todayDeposits / 100;
+        const todayWithdrawals = fin.todayWithdrawals / 100;
+        const todayNetCashFlow = todayDeposits - todayWithdrawals;
 
         res.json({
             success: true,
@@ -662,6 +714,11 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
                 totalUsers, newUsersToday, onlineUsers,
                 totalDeposits: fin.totalDeposits / 100,
                 totalWithdrawals: fin.totalWithdrawals / 100,
+                todayDeposits,
+                todayWithdrawals,
+                todayNetCashFlow,
+                currentWalletLiability,
+                pendingWithdrawalLiability,
                 totalBets: gme.totalBets / 100,
                 totalPayout: gme.totalPayout / 100,
                 houseProfit: gme.totalProfit / 100,
@@ -679,7 +736,7 @@ app.get('/admin/analytics', verifyAdmin, async (req, res) => {
             { $group: {
                 _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
                 profit: { $sum: "$houseProfit" },
-                volume: { $sum: "$totalBets" }
+                volume: { $sum: "$totalPool" }
             } },
             { $sort: { "_id": 1 } }
         ]);
@@ -708,7 +765,7 @@ app.get('/admin/round-analytics', verifyAdmin, async (req, res) => {
     try {
         const colorDistribution = await Round.aggregate([
             { $group: {
-                _id: "$winner",
+                _id: "$winningColor",
                 count: { $sum: 1 },
                 totalProfit: { $sum: "$houseProfit" }
             } }
@@ -718,10 +775,12 @@ app.get('/admin/round-analytics', verifyAdmin, async (req, res) => {
 });
 
 app.post('/admin/force-winner', verifyAdmin, async (req, res) => {
-    const { color } = req.body;
+    const { color, reason } = req.body;
     if (!['green', 'purple', 'blue'].includes(color)) return res.status(400).json({ success: false, error: "Invalid color" });
     game.forcedWinner = color;
     game.forcedBy = req.user.uid;
+    game.forcedReason = reason || "Admin override";
+    game.forcedAt = new Date();
     res.json({ success: true, message: `Forced winner set to ${color}` });
 });
 
@@ -752,6 +811,7 @@ app.post('/admin/withdrawal-action', verifyAdmin, validate(schemas.adminAction),
             tx.processedBy = req.user.uid;
             await tx.save({ session });
         });
+        adminIo.emit("stats_update");
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -799,6 +859,7 @@ app.post('/admin/user/adjust-balance', verifyAdmin, validate(schemas.adjustBalan
             await Transaction.create([{ userId: req.body.userId, type: kobo > 0 ? 'bonus' : 'adjustment', amount: kobo, balanceAfter: user.balance, description: `Admin Adjustment: ${req.body.reason}`, processedBy: req.user.uid }], { session });
             io.to(req.body.userId).emit("balance_update", { balance: user.balance / 100 });
         });
+        adminIo.emit("stats_update");
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
 });
@@ -816,39 +877,72 @@ app.get('/admin/transactions', verifyAdmin, async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
-app.get('/admin/rounds', verifyAdmin, async (req, res) => {
-    try {
-        const rounds = await Round.find().sort({ createdAt: -1 }).limit(20).skip(((req.query.page || 1) - 1) * 20);
-        res.json({ success: true, data: rounds });
-    } catch (e) { res.status(500).json({ success: false }); }
-});
-
 app.get('/admin/round-history', verifyAdmin, async (req, res) => {
     try {
-        const { page = 1, limit = 20 } = req.query;
-        const history = await RoundHistory.find()
-            .sort({ timestamp: -1 })
+        const {
+            page = 1,
+            limit = 20,
+            roundId,
+            winningColor,
+            isForced,
+            startDate,
+            endDate,
+            sort = 'desc'
+        } = req.query;
+
+        let query = {};
+        if (roundId) query.roundId = { $regex: roundId, $options: 'i' };
+        if (winningColor) query.winningColor = winningColor;
+        if (isForced !== undefined && isForced !== '') query.isForced = isForced === 'true';
+
+        if (startDate || endDate) {
+            query.createdAt = {};
+            if (startDate) query.createdAt.$gte = new Date(startDate);
+            if (endDate) query.createdAt.$lte = new Date(endDate);
+        }
+
+        const history = await Round.find(query)
+            .sort({ createdAt: sort === 'desc' ? -1 : 1 })
             .limit(limit * 1)
             .skip((page - 1) * limit);
-        const count = await RoundHistory.countDocuments();
+
+        const count = await Round.countDocuments(query);
         res.json({
             success: true,
             data: {
-                history: history.map(h => ({
-                    ...h.toObject(),
-                    totalPool: h.totalPool / 100,
-                    greenPool: h.greenPool / 100,
-                    purplePool: h.purplePool / 100,
-                    bluePool: h.bluePool / 100,
-                    payoutAmount: h.payoutAmount / 100,
-                    houseProfit: h.houseProfit / 100
-                })),
+                history: history.map(h => {
+                    const obj = h.toObject();
+                    return {
+                        ...obj,
+                        totalPool: (obj.totalPool || 0) / 100,
+                        greenPool: (obj.greenPool || 0) / 100,
+                        purplePool: (obj.purplePool || 0) / 100,
+                        bluePool: (obj.bluePool || 0) / 100,
+                        totalPayout: (obj.totalPayout || 0) / 100,
+                        houseProfit: (obj.houseProfit || 0) / 100,
+                        riskSnapshot: obj.riskSnapshot ? {
+                            green: (obj.riskSnapshot.green || 0) / 100,
+                            purple: (obj.riskSnapshot.purple || 0) / 100,
+                            blue: (obj.riskSnapshot.blue || 0) / 100
+                        } : null,
+                        winningPlayers: (obj.winningPlayers || []).map(p => ({ ...p, betAmount: (p.betAmount || 0) / 100, winningAmount: (p.winningAmount || 0) / 100 })),
+                        losingPlayers: (obj.losingPlayers || []).map(p => ({ ...p, betAmount: (p.betAmount || 0) / 100 })),
+                        colorStats: obj.colorStats ? {
+                            green: { ...obj.colorStats.green, amount: (obj.colorStats.green.amount || 0) / 100 },
+                            purple: { ...obj.colorStats.purple, amount: (obj.colorStats.purple.amount || 0) / 100 },
+                            blue: { ...obj.colorStats.blue, amount: (obj.colorStats.blue.amount || 0) / 100 }
+                        } : null
+                    };
+                }),
                 totalPages: Math.ceil(count / limit),
-                currentPage: page,
+                currentPage: parseInt(page),
                 totalRounds: count
             }
         });
-    } catch (e) { res.status(500).json({ success: false }); }
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false });
+    }
 });
 
 if (MONGO_URI) mongoose.connect(MONGO_URI).then(() => { console.log("✅ DB Connected"); startGameLoop(); });
