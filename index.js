@@ -871,7 +871,11 @@ app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
     try {
         const user = await User.findOne({ userId: req.params.userId });
         if (!user) return res.status(404).json({ success: false });
-        const recent bets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
+        const recentBets = await Bet.find({
+            userId: req.params.userId
+        })
+        .sort({ time: -1 })
+        .limit(10);
         const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
         res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
     } catch (e) { res.status(500).json({ success: false }); }
