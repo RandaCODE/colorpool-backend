@@ -1,4 +1,7 @@
 const mongoose = require('mongoose');
+const SupportTicket = require('./models/SupportTicket');
+const TicketMessage = require('./models/TicketMessage');
+const AdminNote = require('./models/AdminNote');
 
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
@@ -137,5 +140,8 @@ module.exports = {
   Transaction: mongoose.model('Transaction', transactionSchema),
   Round: mongoose.model('Round', roundSchema),
   RoundHistory: mongoose.model('Round', roundSchema), // Alias
-  GlobalState: mongoose.model('GlobalState', globalStateSchema)
+  GlobalState: mongoose.model('GlobalState', globalStateSchema),
+  SupportTicket,
+  TicketMessage,
+  AdminNote
 };

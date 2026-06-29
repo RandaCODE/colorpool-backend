@@ -123,8 +123,10 @@ const io = new Server(server, {
     adapter: createAdapter(pubClient, subClient)
 });
 
-// Admin Namespace
+// Namespaces
 const adminIo = io.of("/admin");
+const supportIo = io.of("/support");
+const adminSupportIo = io.of("/admin/support");
 
 // =======================
 // JOI VALIDATION
@@ -196,6 +198,29 @@ adminIo.use(async (socket, next) => {
     } catch (error) { next(new Error("Unauthorized")); }
 });
 
+// Support Namespace Auth (Future use)
+supportIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
+adminSupportIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return next(new Error("Forbidden"));
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
 io.on("connection", async (socket) => {
     if (socket.userId) socket.join(socket.userId);
     const response = await getGameResponse();
@@ -206,6 +231,17 @@ adminIo.on("connection", async (socket) => {
     const response = await getGameResponse();
     const analytics = await getAdminAnalytics();
     socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
+});
+
+// Support Namespaces Handlers (Placeholders)
+supportIo.on("connection", (socket) => {
+    if (socket.userId) socket.join(`user-support-${socket.userId}`);
+    console.log(`Support user connected: ${socket.userId}`);
+});
+
+adminSupportIo.on("connection", (socket) => {
+    socket.join("admin-support-room");
+    console.log(`Support admin connected: ${socket.userId}`);
 });
 
 // =======================
@@ -483,6 +519,8 @@ const mapTx = t => {
 // =======================
 // ROUTES
 // =======================
+
+app.use('/support', require('./routes/support'));
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
@@ -833,7 +871,7 @@ app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
     try {
         const user = await User.findOne({ userId: req.params.userId });
         if (!user) return res.status(404).json({ success: false });
-        const recentBets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
+        const recent bets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
         const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
         res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
     } catch (e) { res.status(500).json({ success: false }); }
