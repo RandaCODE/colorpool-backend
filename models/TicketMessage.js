@@ -6,7 +6,10 @@ const TicketMessageSchema = new mongoose.Schema({
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     message: { type: String, required: true },
     attachments: [{ type: String }],
+    delivered: { type: Boolean, default: false },
     read: { type: Boolean, default: false },
+    deliveredAt: { type: Date },
+    readAt: { type: Date },
     timestamp: { type: Date, default: Date.now }
 });
 

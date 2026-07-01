@@ -24,8 +24,8 @@ const SupportTicketSchema = new mongoose.Schema({
     description: { type: String, required: true },
     priority: {
         type: String,
-        enum: ['Low', 'Medium', 'High', 'Urgent'],
-        default: 'Low'
+        enum: ['Low', 'Normal', 'High', 'Urgent'],
+        default: 'Normal'
     },
     status: {
         type: String,

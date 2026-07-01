@@ -12,7 +12,7 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
-const { User, Bet, Transaction, GlobalState, Round } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage } = require("./models");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -198,7 +198,6 @@ adminIo.use(async (socket, next) => {
     } catch (error) { next(new Error("Unauthorized")); }
 });
 
-// Support Namespace Auth (Future use)
 supportIo.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth.token || socket.handshake.query.token;
@@ -233,15 +232,73 @@ adminIo.on("connection", async (socket) => {
     socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
 });
 
-// Support Namespaces Handlers (Placeholders)
+// =======================
+// SUPPORT REAL-TIME LOGIC
+// =======================
+
+const updateSupportPresence = async () => {
+    const adminSockets = await adminSupportIo.fetchSockets();
+    const isOnline = adminSockets.length > 0;
+    supportIo.emit('support_presence', { online: isOnline, lastSeen: new Date() });
+};
+
 supportIo.on("connection", (socket) => {
     if (socket.userId) socket.join(`user-support-${socket.userId}`);
-    console.log(`Support user connected: ${socket.userId}`);
+
+    socket.on('join_ticket', (ticketId) => {
+        socket.join(`ticket-${ticketId}`);
+        // Notify others that messages in this ticket are being read
+        socket.to(`ticket-${ticketId}`).emit('messages_read', { ticketId, readerType: 'User' });
+    });
+
+    socket.on('typing', (ticketId) => {
+        socket.to(`ticket-${ticketId}`).emit('typing', { ticketId, senderType: 'User' });
+    });
+
+    socket.on('stop_typing', (ticketId) => {
+        socket.to(`ticket-${ticketId}`).emit('stop_typing', { ticketId, senderType: 'User' });
+    });
+
+    socket.on('mark_read', async (data) => {
+        const { ticketId, messageIds } = data;
+        await TicketMessage.updateMany(
+            { _id: { $in: messageIds }, senderType: 'Admin' },
+            { $set: { read: true, readAt: new Date() } }
+        );
+        socket.to(`ticket-${ticketId}`).emit('messages_read_receipt', { ticketId, messageIds, readerType: 'User' });
+    });
+
+    updateSupportPresence();
+    socket.on('disconnect', updateSupportPresence);
 });
 
 adminSupportIo.on("connection", (socket) => {
     socket.join("admin-support-room");
-    console.log(`Support admin connected: ${socket.userId}`);
+
+    socket.on('join_ticket', (ticketId) => {
+        socket.join(`ticket-${ticketId}`);
+        socket.to(`ticket-${ticketId}`).emit('messages_read', { ticketId, readerType: 'Admin' });
+    });
+
+    socket.on('typing', (ticketId) => {
+        socket.to(`ticket-${ticketId}`).emit('typing', { ticketId, senderType: 'Admin' });
+    });
+
+    socket.on('stop_typing', (ticketId) => {
+        socket.to(`ticket-${ticketId}`).emit('stop_typing', { ticketId, senderType: 'Admin' });
+    });
+
+    socket.on('mark_read', async (data) => {
+        const { ticketId, messageIds } = data;
+        await TicketMessage.updateMany(
+            { _id: { $in: messageIds }, senderType: 'User' },
+            { $set: { read: true, readAt: new Date() } }
+        );
+        socket.to(`ticket-${ticketId}`).emit('messages_read_receipt', { ticketId, messageIds, readerType: 'Admin' });
+    });
+
+    updateSupportPresence();
+    socket.on('disconnect', updateSupportPresence);
 });
 
 // =======================
@@ -520,7 +577,10 @@ const mapTx = t => {
 // ROUTES
 // =======================
 
-app.use('/support', require('./routes/support'));
+app.use('/support', (req, res, next) => {
+    req.io = io;
+    next();
+}, require('./routes/support'));
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
@@ -708,7 +768,6 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
         const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
         const onlineUsers = io.sockets.sockets.size;
 
-        // Current Wallet Liability (Sum of all user balances)
         const userStats = await User.aggregate([{ $group: { _id: null, totalLiability: { $sum: "$balance" } } }]);
         const currentWalletLiability = (userStats[0]?.totalLiability || 0) / 100;
 

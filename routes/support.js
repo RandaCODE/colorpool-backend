@@ -52,7 +52,9 @@ router.post('/create', verifyUser, async (req, res) => {
             category,
             subject,
             description,
-            attachments
+            attachments,
+            status: 'Open',
+            priority: 'Normal'
         });
 
         await ticket.save();
@@ -60,9 +62,11 @@ router.post('/create', verifyUser, async (req, res) => {
         const message = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'User',
-            senderId: user._id, // Mapped to MongoDB ObjectId
+            senderId: user._id,
             message: description,
-            attachments
+            attachments,
+            delivered: true,
+            deliveredAt: new Date()
         });
         await message.save();
 
@@ -91,6 +95,23 @@ router.get('/ticket/:ticketId', verifyUser, async (req, res) => {
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
         const messages = await TicketMessage.find({ ticketId: ticket._id }).sort({ timestamp: 1 });
+
+        // Mark admin messages as read when user opens the ticket
+        const unreadAdminMessages = messages.filter(m => m.senderType === 'Admin' && !m.read).map(m => m._id);
+        if (unreadAdminMessages.length > 0) {
+            await TicketMessage.updateMany(
+                { _id: { $in: unreadAdminMessages } },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            if (req.io) {
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
+                    ticketId: ticket.ticketId,
+                    messageIds: unreadAdminMessages,
+                    readerType: 'User'
+                });
+            }
+        }
+
         res.json({ success: true, data: { ticket, messages } });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -110,19 +131,33 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
         const newMessage = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'User',
-            senderId: user._id, // Mapped to MongoDB ObjectId
+            senderId: user._id,
             message,
-            attachments
+            attachments,
+            delivered: true,
+            deliveredAt: new Date()
         });
 
         await newMessage.save();
 
-        ticket.status = 'Open';
+        // If ticket was resolved/pending, replying can reopen it or keep it open
+        if (ticket.status !== 'Open') {
+            ticket.status = 'Open';
+        }
         ticket.lastReplyAt = new Date();
         await ticket.save();
 
         if (req.io) {
-            req.io.of('/admin/support').emit('ticket_update', { ticketId: ticket.ticketId, message: newMessage });
+            // Real-time message
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
+            // Notification for dashboard
+            req.io.of('/admin/support').emit('ticket_update', {
+                ticketId: ticket.ticketId,
+                status: ticket.status,
+                priority: ticket.priority,
+                lastMessage: message
+            });
         }
 
         res.json({ success: true, data: newMessage });
@@ -183,6 +218,22 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
         const messages = await TicketMessage.find({ ticketId: ticket._id }).sort({ timestamp: 1 });
         const notes = await AdminNote.find({ ticketId: ticket._id }).sort({ createdAt: -1 });
 
+        // Mark user messages as read when admin opens the ticket
+        const unreadUserMessages = messages.filter(m => m.senderType === 'User' && !m.read).map(m => m._id);
+        if (unreadUserMessages.length > 0) {
+            await TicketMessage.updateMany(
+                { _id: { $in: unreadUserMessages } },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            if (req.io) {
+                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
+                    ticketId: ticket.ticketId,
+                    messageIds: unreadUserMessages,
+                    readerType: 'Admin'
+                });
+            }
+        }
+
         res.json({ success: true, data: { ticket, messages, notes } });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -201,9 +252,11 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
         const newMessage = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'Admin',
-            senderId: adminUser._id, // Mapped to MongoDB ObjectId
+            senderId: adminUser._id,
             message,
-            attachments
+            attachments,
+            delivered: true,
+            deliveredAt: new Date()
         });
 
         await newMessage.save();
@@ -214,32 +267,20 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
         await ticket.save();
 
         if (req.io) {
-            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('new_message', { ticketId: ticket.ticketId, message: newMessage });
+            // Emit to specific ticket room in both namespaces
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
+
+            // Notification for user app if not in room (general support namespace)
+            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', {
+                ticketId: ticket.ticketId,
+                status: ticket.status,
+                priority: ticket.priority,
+                lastMessage: message
+            });
         }
 
         res.json({ success: true, data: newMessage });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.post('/admin/ticket/:ticketId/note', verifyAdmin, async (req, res) => {
-    try {
-        const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
-        if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
-
-        const adminUser = await User.findOne({ userId: req.admin.uid });
-        if (!adminUser) return res.status(404).json({ success: false, error: 'Admin user not found' });
-
-        const { note } = req.body;
-        const newNote = new AdminNote({
-            ticketId: ticket._id,
-            adminId: adminUser._id, // Mapped to MongoDB ObjectId
-            note
-        });
-
-        await newNote.save();
-        res.json({ success: true, data: newNote });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -264,53 +305,21 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
 
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
-        if (req.io && status) {
-            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', { ticketId: ticket.ticketId, status: ticket.status });
+        if (req.io) {
+            // Notify both namespaces about the status/priority update
+            const updatePayload = {
+                ticketId: ticket.ticketId,
+                status: ticket.status,
+                priority: ticket.priority
+            };
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+
+            // Also notify user generally
+            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', updatePayload);
         }
 
         res.json({ success: true, data: ticket });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/admin/stats', verifyAdmin, async (req, res) => {
-    try {
-        const now = new Date();
-        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const startOfTomorrow = new Date(startOfToday);
-        startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
-
-        const stats = {
-            open: await SupportTicket.countDocuments({ status: 'Open' }),
-            pending: await SupportTicket.countDocuments({ status: 'Pending' }),
-            resolvedToday: await SupportTicket.countDocuments({
-                status: 'Resolved',
-                updatedAt: { $gte: startOfToday, $lt: startOfTomorrow }
-            }),
-            closedToday: await SupportTicket.countDocuments({
-                status: 'Closed',
-                closedAt: { $gte: startOfToday, $lt: startOfTomorrow }
-            }),
-            ticketsToday: await SupportTicket.countDocuments({
-                createdAt: { $gte: startOfToday, $lt: startOfTomorrow }
-            }),
-            ticketsThisWeek: await SupportTicket.countDocuments({
-                createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) }
-            }),
-            ticketsThisMonth: await SupportTicket.countDocuments({
-                createdAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
-            })
-        };
-
-        const commonCategory = await SupportTicket.aggregate([
-            { $group: { _id: "$category", count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-            { $limit: 1 }
-        ]);
-        stats.mostCommonCategory = commonCategory[0]?._id || 'None';
-
-        res.json({ success: true, data: stats });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
