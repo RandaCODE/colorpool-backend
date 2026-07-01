@@ -21,7 +21,6 @@ async function verifyAdmin(req, res, next) {
         if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
         const decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
 
-        // In this project, Admin status is checked against the User model's isAdmin flag
         const user = await User.findOne({ userId: decodedToken.uid });
         if (!user || !user.isAdmin) return res.status(403).json({ success: false, error: 'Forbidden' });
 
@@ -30,7 +29,6 @@ async function verifyAdmin(req, res, next) {
     } catch (error) { return res.status(401).json({ success: false, error: 'Invalid session' }); }
 }
 
-// Helper to generate Ticket ID
 const generateTicketId = () => {
     return 'TK-' + Math.random().toString(36).substr(2, 9).toUpperCase();
 };
@@ -39,11 +37,11 @@ const generateTicketId = () => {
 // USER ENDPOINTS
 // =======================
 
-// Create Ticket
 router.post('/create', verifyUser, async (req, res) => {
     try {
         const { category, subject, description, phone, attachments } = req.body;
         const user = await User.findOne({ userId: req.user.uid });
+        if (!user) return res.status(404).json({ success: false, error: 'User not found' });
 
         const ticket = new SupportTicket({
             ticketId: generateTicketId(),
@@ -59,15 +57,18 @@ router.post('/create', verifyUser, async (req, res) => {
 
         await ticket.save();
 
-        // Save initial message as first conversation item
         const message = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'User',
-            senderId: req.user.uid,
+            senderId: user._id, // Mapped to MongoDB ObjectId
             message: description,
             attachments
         });
         await message.save();
+
+        if (req.io) {
+            req.io.of('/admin/support').emit('new_ticket', ticket);
+        }
 
         res.json({ success: true, data: ticket });
     } catch (error) {
@@ -75,7 +76,6 @@ router.post('/create', verifyUser, async (req, res) => {
     }
 });
 
-// Get User's Tickets
 router.get('/my-tickets', verifyUser, async (req, res) => {
     try {
         const tickets = await SupportTicket.find({ userId: req.user.uid }).sort({ updatedAt: -1 });
@@ -85,7 +85,6 @@ router.get('/my-tickets', verifyUser, async (req, res) => {
     }
 });
 
-// Get Ticket Details (User)
 router.get('/ticket/:ticketId', verifyUser, async (req, res) => {
     try {
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId, userId: req.user.uid });
@@ -98,27 +97,33 @@ router.get('/ticket/:ticketId', verifyUser, async (req, res) => {
     }
 });
 
-// Reply to Ticket (User)
 router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
     try {
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId, userId: req.user.uid });
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
         if (ticket.status === 'Closed') return res.status(400).json({ success: false, error: 'Ticket is closed' });
 
+        const user = await User.findOne({ userId: req.user.uid });
+        if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+
         const { message, attachments } = req.body;
         const newMessage = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'User',
-            senderId: req.user.uid,
+            senderId: user._id, // Mapped to MongoDB ObjectId
             message,
             attachments
         });
 
         await newMessage.save();
 
-        ticket.status = 'Open'; // Re-open or keep open if user replies
+        ticket.status = 'Open';
         ticket.lastReplyAt = new Date();
         await ticket.save();
+
+        if (req.io) {
+            req.io.of('/admin/support').emit('ticket_update', { ticketId: ticket.ticketId, message: newMessage });
+        }
 
         res.json({ success: true, data: newMessage });
     } catch (error) {
@@ -130,7 +135,6 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
 // ADMIN ENDPOINTS
 // =======================
 
-// List All Tickets
 router.get('/admin/list', verifyAdmin, async (req, res) => {
     try {
         const { status, priority, category, search, page = 1, limit = 50 } = req.query;
@@ -171,7 +175,6 @@ router.get('/admin/list', verifyAdmin, async (req, res) => {
     }
 });
 
-// Get Ticket Details (Admin)
 router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
     try {
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
@@ -186,17 +189,19 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
     }
 });
 
-// Reply to Ticket (Admin)
 router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
     try {
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
+        const adminUser = await User.findOne({ userId: req.admin.uid });
+        if (!adminUser) return res.status(404).json({ success: false, error: 'Admin user not found' });
+
         const { message, attachments, status } = req.body;
         const newMessage = new TicketMessage({
             ticketId: ticket._id,
             senderType: 'Admin',
-            senderId: req.admin.uid,
+            senderId: adminUser._id, // Mapped to MongoDB ObjectId
             message,
             attachments
         });
@@ -208,22 +213,28 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
         ticket.assignedAdmin = req.admin.uid;
         await ticket.save();
 
+        if (req.io) {
+            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('new_message', { ticketId: ticket.ticketId, message: newMessage });
+        }
+
         res.json({ success: true, data: newMessage });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Add Admin Note
 router.post('/admin/ticket/:ticketId/note', verifyAdmin, async (req, res) => {
     try {
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
+        const adminUser = await User.findOne({ userId: req.admin.uid });
+        if (!adminUser) return res.status(404).json({ success: false, error: 'Admin user not found' });
+
         const { note } = req.body;
         const newNote = new AdminNote({
             ticketId: ticket._id,
-            adminId: req.admin.uid,
+            adminId: adminUser._id, // Mapped to MongoDB ObjectId
             note
         });
 
@@ -234,7 +245,6 @@ router.post('/admin/ticket/:ticketId/note', verifyAdmin, async (req, res) => {
     }
 });
 
-// Update Ticket Status/Priority/Assignee
 router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
     try {
         const { status, priority, assignedAdmin } = req.body;
@@ -253,13 +263,17 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
         );
 
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
+
+        if (req.io && status) {
+            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', { ticketId: ticket.ticketId, status: ticket.status });
+        }
+
         res.json({ success: true, data: ticket });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Dashboard Statistics
 router.get('/admin/stats', verifyAdmin, async (req, res) => {
     try {
         const now = new Date();
@@ -281,7 +295,6 @@ router.get('/admin/stats', verifyAdmin, async (req, res) => {
             ticketsToday: await SupportTicket.countDocuments({
                 createdAt: { $gte: startOfToday, $lt: startOfTomorrow }
             }),
-            // Weekly/Monthly stats
             ticketsThisWeek: await SupportTicket.countDocuments({
                 createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) }
             }),
@@ -290,10 +303,6 @@ router.get('/admin/stats', verifyAdmin, async (req, res) => {
             })
         };
 
-        // Average Response Time (Simplistic implementation: time between creation and first Admin message)
-        // In a real scenario, this would be more complex
-
-        // Most common category
         const commonCategory = await SupportTicket.aggregate([
             { $group: { _id: "$category", count: { $sum: 1 } } },
             { $sort: { count: -1 } },
