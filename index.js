@@ -391,7 +391,7 @@ async function getAdminAnalytics() {
     const liabilities = {
         green: greenKobo * multipliers.green,
         purple: purpleKobo * multipliers.purple,
-        blue: liabilities.blue * multipliers.blue
+        blue: blueKobo * multipliers.blue
     };
 
     const exposure = {
