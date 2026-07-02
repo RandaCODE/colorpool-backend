@@ -250,11 +250,21 @@ supportIo.on("connection", (socket) => {
         socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Customer", ticketId: data.ticketId });
     });
 
-    // Check support online status
+    socket.on("messageSeen", async (data) => {
+        const { ticketId, messageIds } = data;
+        try {
+            await TicketMessage.updateMany(
+                { _id: { $in: messageIds }, senderType: 'Admin' },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            adminSupportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", { ticketId, messageIds, readerType: 'User' });
+        } catch (e) { console.error("Error in messageSeen:", e); }
+    });
+
     socket.on("check_support_status", async () => {
         const adminSockets = await adminSupportIo.fetchSockets();
         const isOnline = adminSockets.length > 0;
-        socket.emit("support_status", { online: isOnline, lastSeen: new Date() }); // Simplified lastSeen
+        socket.emit("support_status", { online: isOnline, lastSeen: new Date() });
     });
 });
 
@@ -262,7 +272,6 @@ adminSupportIo.on("connection", (socket) => {
     socket.join("admin-support-room");
     console.log(`Support admin connected: ${socket.userId}`);
 
-    // Notify users that support is online
     supportIo.emit("support_status", { online: true, lastSeen: new Date() });
 
     socket.on("join_ticket", (ticketId) => {
@@ -278,8 +287,15 @@ adminSupportIo.on("connection", (socket) => {
         socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Admin", ticketId: data.ticketId });
     });
 
-    socket.on("mark_read", async (data) => {
-        // Handled via REST but can be optimized here
+    socket.on("messageSeen", async (data) => {
+        const { ticketId, messageIds } = data;
+        try {
+            await TicketMessage.updateMany(
+                { _id: { $in: messageIds }, senderType: 'User' },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            supportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", { ticketId, messageIds, readerType: 'Admin' });
+        } catch (e) { console.error("Error in messageSeen (admin):", e); }
     });
 
     socket.on("disconnect", async () => {
@@ -375,7 +391,7 @@ async function getAdminAnalytics() {
     const liabilities = {
         green: greenKobo * multipliers.green,
         purple: purpleKobo * multipliers.purple,
-        blue: blueKobo * multipliers.blue
+        blue: liabilities.blue * multipliers.blue
     };
 
     const exposure = {
@@ -760,7 +776,6 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
         const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
         const onlineUsers = io.sockets.sockets.size;
 
-        // Current Wallet Liability (Sum of all user balances)
         const userStats = await User.aggregate([{ $group: { _id: null, totalLiability: { $sum: "$balance" } } }]);
         const currentWalletLiability = (userStats[0]?.totalLiability || 0) / 100;
 
@@ -923,7 +938,7 @@ app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
     try {
         const user = await User.findOne({ userId: req.params.userId });
         if (!user) return res.status(404).json({ success: false });
-        const recent bets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
+        const recentBets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
         const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
         res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
     } catch (e) { res.status(500).json({ success: false }); }
