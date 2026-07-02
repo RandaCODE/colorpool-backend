@@ -232,73 +232,62 @@ adminIo.on("connection", async (socket) => {
     socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
 });
 
-// =======================
-// SUPPORT REAL-TIME LOGIC
-// =======================
-
-const updateSupportPresence = async () => {
-    const adminSockets = await adminSupportIo.fetchSockets();
-    const isOnline = adminSockets.length > 0;
-    supportIo.emit('support_presence', { online: isOnline, lastSeen: new Date() });
-};
-
+// Support Namespaces Handlers
 supportIo.on("connection", (socket) => {
     if (socket.userId) socket.join(`user-support-${socket.userId}`);
+    console.log(`Support user connected: ${socket.userId}`);
 
-    socket.on('join_ticket', (ticketId) => {
+    socket.on("join_ticket", (ticketId) => {
         socket.join(`ticket-${ticketId}`);
-        // Notify others that messages in this ticket are being read
-        socket.to(`ticket-${ticketId}`).emit('messages_read', { ticketId, readerType: 'User' });
+        console.log(`User joined ticket room: ticket-${ticketId}`);
     });
 
-    socket.on('typing', (ticketId) => {
-        socket.to(`ticket-${ticketId}`).emit('typing', { ticketId, senderType: 'User' });
+    socket.on("typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("typing", { type: "Customer", ticketId: data.ticketId });
     });
 
-    socket.on('stop_typing', (ticketId) => {
-        socket.to(`ticket-${ticketId}`).emit('stop_typing', { ticketId, senderType: 'User' });
+    socket.on("stop_typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Customer", ticketId: data.ticketId });
     });
 
-    socket.on('mark_read', async (data) => {
-        const { ticketId, messageIds } = data;
-        await TicketMessage.updateMany(
-            { _id: { $in: messageIds }, senderType: 'Admin' },
-            { $set: { read: true, readAt: new Date() } }
-        );
-        socket.to(`ticket-${ticketId}`).emit('messages_read_receipt', { ticketId, messageIds, readerType: 'User' });
+    // Check support online status
+    socket.on("check_support_status", async () => {
+        const adminSockets = await adminSupportIo.fetchSockets();
+        const isOnline = adminSockets.length > 0;
+        socket.emit("support_status", { online: isOnline, lastSeen: new Date() }); // Simplified lastSeen
     });
-
-    updateSupportPresence();
-    socket.on('disconnect', updateSupportPresence);
 });
 
 adminSupportIo.on("connection", (socket) => {
     socket.join("admin-support-room");
+    console.log(`Support admin connected: ${socket.userId}`);
 
-    socket.on('join_ticket', (ticketId) => {
+    // Notify users that support is online
+    supportIo.emit("support_status", { online: true, lastSeen: new Date() });
+
+    socket.on("join_ticket", (ticketId) => {
         socket.join(`ticket-${ticketId}`);
-        socket.to(`ticket-${ticketId}`).emit('messages_read', { ticketId, readerType: 'Admin' });
+        console.log(`Admin joined ticket room: ticket-${ticketId}`);
     });
 
-    socket.on('typing', (ticketId) => {
-        socket.to(`ticket-${ticketId}`).emit('typing', { ticketId, senderType: 'Admin' });
+    socket.on("typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("typing", { type: "Admin", ticketId: data.ticketId });
     });
 
-    socket.on('stop_typing', (ticketId) => {
-        socket.to(`ticket-${ticketId}`).emit('stop_typing', { ticketId, senderType: 'Admin' });
+    socket.on("stop_typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Admin", ticketId: data.ticketId });
     });
 
-    socket.on('mark_read', async (data) => {
-        const { ticketId, messageIds } = data;
-        await TicketMessage.updateMany(
-            { _id: { $in: messageIds }, senderType: 'User' },
-            { $set: { read: true, readAt: new Date() } }
-        );
-        socket.to(`ticket-${ticketId}`).emit('messages_read_receipt', { ticketId, messageIds, readerType: 'Admin' });
+    socket.on("mark_read", async (data) => {
+        // Handled via REST but can be optimized here
     });
 
-    updateSupportPresence();
-    socket.on('disconnect', updateSupportPresence);
+    socket.on("disconnect", async () => {
+        const adminSockets = await adminSupportIo.fetchSockets();
+        if (adminSockets.length === 0) {
+            supportIo.emit("support_status", { online: false, lastSeen: new Date() });
+        }
+    });
 });
 
 // =======================
@@ -306,6 +295,12 @@ adminSupportIo.on("connection", (socket) => {
 // =======================
 app.use(cors());
 app.use(express.json());
+
+// Inject io into request
+app.use((req, res, next) => {
+    req.io = io;
+    next();
+});
 
 async function verifyToken(req, res, next) {
     try {
@@ -577,10 +572,7 @@ const mapTx = t => {
 // ROUTES
 // =======================
 
-app.use('/support', (req, res, next) => {
-    req.io = io;
-    next();
-}, require('./routes/support'));
+app.use('/support', require('./routes/support'));
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
@@ -768,6 +760,7 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
         const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
         const onlineUsers = io.sockets.sockets.size;
 
+        // Current Wallet Liability (Sum of all user balances)
         const userStats = await User.aggregate([{ $group: { _id: null, totalLiability: { $sum: "$balance" } } }]);
         const currentWalletLiability = (userStats[0]?.totalLiability || 0) / 100;
 
@@ -930,11 +923,7 @@ app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
     try {
         const user = await User.findOne({ userId: req.params.userId });
         if (!user) return res.status(404).json({ success: false });
-        const recentBets = await Bet.find({
-            userId: req.params.userId
-        })
-        .sort({ time: -1 })
-        .limit(10);
+        const recent bets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
         const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
         res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
     } catch (e) { res.status(500).json({ success: false }); }
