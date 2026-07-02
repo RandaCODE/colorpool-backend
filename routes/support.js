@@ -72,6 +72,7 @@ router.post('/create', verifyUser, async (req, res) => {
 
         if (req.io) {
             req.io.of('/admin/support').emit('new_ticket', ticket);
+            if (req.emitSupportStats) req.emitSupportStats();
         }
 
         res.json({ success: true, data: ticket });
@@ -106,7 +107,7 @@ router.get('/ticket/:ticketId', verifyUser, async (req, res) => {
             if (req.io) {
                 req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
                     ticketId: ticket.ticketId,
-                    messageIds: unreadAdminMessages,
+                    messageIds: unreadAdminMessages.map(id => id.toString()),
                     readerType: 'User'
                 });
             }
@@ -140,7 +141,7 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
 
         await newMessage.save();
 
-        // If ticket was resolved/pending, replying can reopen it or keep it open
+        const oldStatus = ticket.status;
         if (ticket.status !== 'Open') {
             ticket.status = 'Open';
         }
@@ -158,6 +159,7 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
                 priority: ticket.priority,
                 lastMessage: message
             });
+            if (oldStatus !== 'Open' && req.emitSupportStats) req.emitSupportStats();
         }
 
         res.json({ success: true, data: newMessage });
@@ -228,7 +230,7 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
             if (req.io) {
                 req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
                     ticketId: ticket.ticketId,
-                    messageIds: unreadUserMessages,
+                    messageIds: unreadUserMessages.map(id => id.toString()),
                     readerType: 'Admin'
                 });
             }
@@ -261,9 +263,15 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
 
         await newMessage.save();
 
-        ticket.status = status || 'Pending';
+        const oldStatus = ticket.status;
+        const newStatus = status || 'Pending';
+        ticket.status = newStatus;
         ticket.lastReplyAt = new Date();
         ticket.assignedAdmin = req.admin.uid;
+
+        if (newStatus === 'Resolved' && oldStatus !== 'Resolved') ticket.resolvedAt = new Date();
+        if (newStatus === 'Closed' && oldStatus !== 'Closed') ticket.closedAt = new Date();
+
         await ticket.save();
 
         if (req.io) {
@@ -278,6 +286,17 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
                 priority: ticket.priority,
                 lastMessage: message
             });
+
+            // Meta update for everyone in the room
+            const updatePayload = {
+                ticketId: ticket.ticketId,
+                status: ticket.status,
+                priority: ticket.priority
+            };
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+
+            if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
         }
 
         res.json({ success: true, data: newMessage });
@@ -289,21 +308,21 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
 router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
     try {
         const { status, priority, assignedAdmin } = req.body;
-        const update = {};
-        if (status) {
-            update.status = status;
-            if (status === 'Closed') update.closedAt = new Date();
-        }
-        if (priority) update.priority = priority;
-        if (assignedAdmin) update.assignedAdmin = assignedAdmin;
 
-        const ticket = await SupportTicket.findOneAndUpdate(
-            { ticketId: req.params.ticketId },
-            { $set: update },
-            { new: true }
-        );
-
+        const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
+
+        const oldStatus = ticket.status;
+
+        if (status) {
+            ticket.status = status;
+            if (status === 'Closed' && oldStatus !== 'Closed') ticket.closedAt = new Date();
+            if (status === 'Resolved' && oldStatus !== 'Resolved') ticket.resolvedAt = new Date();
+        }
+        if (priority) ticket.priority = priority;
+        if (assignedAdmin) ticket.assignedAdmin = assignedAdmin;
+
+        await ticket.save();
 
         if (req.io) {
             // Notify both namespaces about the status/priority update
@@ -317,6 +336,8 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
 
             // Also notify user generally
             req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', updatePayload);
+
+            if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
         }
 
         res.json({ success: true, data: ticket });

@@ -128,6 +128,24 @@ const adminIo = io.of("/admin");
 const supportIo = io.of("/support");
 const adminSupportIo = io.of("/admin/support");
 
+// Helper to emit support statistics
+async function emitSupportStats() {
+    try {
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+        const openTickets = await SupportTicket.countDocuments({ status: 'Open' });
+        const pendingTickets = await SupportTicket.countDocuments({ status: 'Pending' });
+        const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
+        const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
+
+        const stats = { openTickets, pendingTickets, resolvedToday, closedToday };
+        adminIo.emit('support_stats_update', stats);
+        adminIo.emit('stats_update'); // Trigger dashboard refresh
+        return stats;
+    } catch (e) {
+        console.error("Error emitting support stats:", e);
+    }
+}
+
 // =======================
 // JOI VALIDATION
 // =======================
@@ -224,16 +242,21 @@ io.on("connection", async (socket) => {
     if (socket.userId) socket.join(socket.userId);
     const response = await getGameResponse();
     socket.emit("game_update", response);
+
+    // Initial admin presence for game app
+    const adminSockets = await adminSupportIo.fetchSockets();
+    socket.emit("adminOnlineStatus", adminSockets.length > 0);
 });
 
 adminIo.on("connection", async (socket) => {
     const response = await getGameResponse();
     const analytics = await getAdminAnalytics();
     socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
+    emitSupportStats();
 });
 
 // Support Namespaces Handlers
-supportIo.on("connection", (socket) => {
+supportIo.on("connection", async (socket) => {
     if (socket.userId) socket.join(`user-support-${socket.userId}`);
     console.log(`Support user connected: ${socket.userId}`);
 
@@ -261,18 +284,22 @@ supportIo.on("connection", (socket) => {
         } catch (e) { console.error("Error in messageSeen:", e); }
     });
 
-    socket.on("check_support_status", async () => {
-        const adminSockets = await adminSupportIo.fetchSockets();
-        const isOnline = adminSockets.length > 0;
-        socket.emit("support_status", { online: isOnline, lastSeen: new Date() });
-    });
+    // Notify user of support presence immediately
+    const adminSockets = await adminSupportIo.fetchSockets();
+    const isOnline = adminSockets.length > 0;
+    socket.emit("support_presence", { online: isOnline, lastSeen: new Date() });
 });
 
-adminSupportIo.on("connection", (socket) => {
+adminSupportIo.on("connection", async (socket) => {
     socket.join("admin-support-room");
     console.log(`Support admin connected: ${socket.userId}`);
 
-    supportIo.emit("support_status", { online: true, lastSeen: new Date() });
+    // Notify all users and namespaces that an admin is online
+    const presenceData = { online: true, lastSeen: new Date() };
+    supportIo.emit("support_presence", presenceData);
+    supportIo.emit("adminOnline");
+    io.emit("adminOnline");
+    io.emit("adminOnlineStatus", true);
 
     socket.on("join_ticket", (ticketId) => {
         socket.join(`ticket-${ticketId}`);
@@ -299,10 +326,17 @@ adminSupportIo.on("connection", (socket) => {
     });
 
     socket.on("disconnect", async () => {
-        const adminSockets = await adminSupportIo.fetchSockets();
-        if (adminSockets.length === 0) {
-            supportIo.emit("support_status", { online: false, lastSeen: new Date() });
-        }
+        // Wait briefly for socket list to update
+        setTimeout(async () => {
+            const adminSockets = await adminSupportIo.fetchSockets();
+            if (adminSockets.length === 0) {
+                const offlineData = { online: false, lastSeen: new Date() };
+                supportIo.emit("support_presence", offlineData);
+                supportIo.emit("adminOffline");
+                io.emit("adminOffline");
+                io.emit("adminOnlineStatus", false);
+            }
+        }, 1000);
     });
 });
 
@@ -312,9 +346,10 @@ adminSupportIo.on("connection", (socket) => {
 app.use(cors());
 app.use(express.json());
 
-// Inject io into request
+// Inject io and stats helper into request
 app.use((req, res, next) => {
     req.io = io;
+    req.emitSupportStats = emitSupportStats;
     next();
 });
 
@@ -806,6 +841,12 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
             } }
         ]);
 
+        // Support Statistics - Updated to use status-specific timestamps
+        const openTickets = await SupportTicket.countDocuments({ status: 'Open' });
+        const pendingTickets = await SupportTicket.countDocuments({ status: 'Pending' });
+        const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
+        const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
+
         const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0, todayDeposits: 0, todayWithdrawals: 0 };
         const gme = gameStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 };
 
@@ -827,7 +868,12 @@ app.get('/admin/stats', verifyAdmin, async (req, res) => {
                 totalBets: gme.totalBets / 100,
                 totalPayout: gme.totalPayout / 100,
                 houseProfit: gme.totalProfit / 100,
-                totalRounds: gme.count
+                totalRounds: gme.count,
+                // Support counts
+                openTickets,
+                pendingTickets,
+                resolvedToday,
+                closedToday
             }
         });
     } catch (e) { res.status(500).json({ success: false }); }

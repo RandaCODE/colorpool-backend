@@ -35,6 +35,7 @@ const SupportTicketSchema = new mongoose.Schema({
     assignedAdmin: { type: String }, // Firebase UID of Admin
     attachments: [{ type: String }],
     lastReplyAt: { type: Date, default: Date.now },
+    resolvedAt: { type: Date },
     closedAt: { type: Date }
 }, { timestamps: true });
 
