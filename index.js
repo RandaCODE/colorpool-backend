@@ -137,9 +137,14 @@ async function emitSupportStats() {
         const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
         const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
 
-        const stats = { openTickets, pendingTickets, resolvedToday, closedToday };
-        adminIo.emit('support_stats_update', stats);
-        adminIo.emit('stats_update'); // Trigger dashboard refresh
+        const stats = { open: openTickets, pending: pendingTickets, resolvedToday, closedToday };
+        // Support Stats Updates
+        adminSupportIo.emit('support_stats_update', stats);
+        adminSupportIo.emit('ticketStatsUpdated', stats); // User requested name
+
+        // General Admin Dashboard Refresh
+        adminIo.emit('stats_update');
+
         return stats;
     } catch (e) {
         console.error("Error emitting support stats:", e);
@@ -280,7 +285,10 @@ supportIo.on("connection", async (socket) => {
                 { _id: { $in: messageIds }, senderType: 'Admin' },
                 { $set: { read: true, readAt: new Date() } }
             );
-            adminSupportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", { ticketId, messageIds, readerType: 'User' });
+            // Notify Admin side
+            const payload = { ticketId, messageIds, readerType: 'User' };
+            adminSupportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", payload);
+            adminSupportIo.to(`ticket-${ticketId}`).emit("messageSeen", payload);
         } catch (e) { console.error("Error in messageSeen:", e); }
     });
 
@@ -288,6 +296,7 @@ supportIo.on("connection", async (socket) => {
     const adminSockets = await adminSupportIo.fetchSockets();
     const isOnline = adminSockets.length > 0;
     socket.emit("support_presence", { online: isOnline, lastSeen: new Date() });
+    socket.emit(isOnline ? "adminOnline" : "adminOffline");
 });
 
 adminSupportIo.on("connection", async (socket) => {
@@ -321,7 +330,10 @@ adminSupportIo.on("connection", async (socket) => {
                 { _id: { $in: messageIds }, senderType: 'User' },
                 { $set: { read: true, readAt: new Date() } }
             );
-            supportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", { ticketId, messageIds, readerType: 'Admin' });
+            // Notify User side
+            const payload = { ticketId, messageIds, readerType: 'Admin' };
+            supportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", payload);
+            supportIo.to(`ticket-${ticketId}`).emit("messageSeen", payload);
         } catch (e) { console.error("Error in messageSeen (admin):", e); }
     });
 

@@ -105,11 +105,13 @@ router.get('/ticket/:ticketId', verifyUser, async (req, res) => {
                 { $set: { read: true, readAt: new Date() } }
             );
             if (req.io) {
-                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
+                const receiptPayload = {
                     ticketId: ticket.ticketId,
                     messageIds: unreadAdminMessages.map(id => id.toString()),
                     readerType: 'User'
-                });
+                };
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', receiptPayload);
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messageSeen', receiptPayload);
             }
         }
 
@@ -152,6 +154,16 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
             // Real-time message
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
+
+            // Sync status
+            if (oldStatus !== 'Open') {
+                const metaPayload = { ticketId: ticket.ticketId, status: ticket.status, priority: ticket.priority };
+                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', metaPayload);
+                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', metaPayload);
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', metaPayload);
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', metaPayload);
+            }
+
             // Notification for dashboard
             req.io.of('/admin/support').emit('ticket_update', {
                 ticketId: ticket.ticketId,
@@ -228,11 +240,16 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
                 { $set: { read: true, readAt: new Date() } }
             );
             if (req.io) {
-                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', {
+                const receiptPayload = {
                     ticketId: ticket.ticketId,
                     messageIds: unreadUserMessages.map(id => id.toString()),
                     readerType: 'Admin'
-                });
+                };
+                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', receiptPayload);
+                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messageSeen', receiptPayload);
+                // Also notify other admins
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', receiptPayload);
+                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messageSeen', receiptPayload);
             }
         }
 
@@ -294,7 +311,9 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
                 priority: ticket.priority
             };
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
 
             if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
         }
@@ -332,7 +351,9 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
                 priority: ticket.priority
             };
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
 
             // Also notify user generally
             req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', updatePayload);
