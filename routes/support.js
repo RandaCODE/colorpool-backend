@@ -184,6 +184,23 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
 // ADMIN ENDPOINTS
 // =======================
 
+router.get('/admin/stats', verifyAdmin, async (req, res) => {
+    try {
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+        const open = await SupportTicket.countDocuments({ status: 'Open' });
+        const pending = await SupportTicket.countDocuments({ status: 'Pending' });
+        const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
+        const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
+
+        res.json({
+            success: true,
+            data: { open, pending, resolvedToday, closedToday }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 router.get('/admin/list', verifyAdmin, async (req, res) => {
     try {
         const { status, priority, category, search, page = 1, limit = 50 } = req.query;
