@@ -45,7 +45,7 @@ const transactionSchema = new mongoose.Schema({
   payout: { type: Number, default: 0 },     // KOBO
   balanceAfter: { type: Number },           // KOBO
   description: { type: String },
-  status: { type: String, enum: ['pending', 'success', 'failed', 'rejected'], default: 'success' },
+  status: { type: String, enum: ['pending', 'success', 'failed', 'rejected', 'approved', 'completed', 'paid'], default: 'success' },
   reference: { type: String, unique: true, sparse: true },
   bankDetails: {
     accountNumber: String,

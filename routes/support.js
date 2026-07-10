@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { SupportTicket, TicketMessage, AdminNote, User } = require('../models');
 const admin = require('firebase-admin');
+const { createNotification } = require('../utils/notificationHelper');
 
 // Middleware to verify Firebase token for Users
 async function verifyUser(req, res, next) {
@@ -72,6 +73,17 @@ router.post('/create', verifyUser, async (req, res) => {
 
         if (req.io) {
             req.io.of('/admin/support').emit('new_ticket', ticket);
+
+            // Create notification using helper
+            createNotification(req.io, {
+                uid: req.user.uid,
+                title: 'Ticket Created',
+                message: `Your support ticket ${ticket.ticketId} has been successfully created.`,
+                type: 'support',
+                priority: 'normal',
+                metadata: { ticketId: ticket.ticketId }
+            });
+
             if (req.emitSupportStats) req.emitSupportStats();
         }
 
@@ -313,6 +325,16 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
 
+            // Notification for user app
+            createNotification(req.io, {
+                uid: ticket.userId,
+                title: 'New Support Reply',
+                message: `An admin has replied to your ticket ${ticket.ticketId}.`,
+                type: 'support',
+                priority: 'high',
+                metadata: { ticketId: ticket.ticketId }
+            });
+
             // Notification for user app if not in room (general support namespace)
             req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', {
                 ticketId: ticket.ticketId,
@@ -354,6 +376,18 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
             ticket.status = status;
             if (status === 'Closed' && oldStatus !== 'Closed') ticket.closedAt = new Date();
             if (status === 'Resolved' && oldStatus !== 'Resolved') ticket.resolvedAt = new Date();
+
+            // Notify user of status change
+            if (status !== oldStatus && req.io) {
+                createNotification(req.io, {
+                    uid: ticket.userId,
+                    title: 'Ticket Status Updated',
+                    message: `Your support ticket ${ticket.ticketId} status has been changed to ${status}.`,
+                    type: 'support',
+                    priority: 'normal',
+                    metadata: { ticketId: ticket.ticketId, status }
+                });
+            }
         }
         if (priority) ticket.priority = priority;
         if (assignedAdmin) ticket.assignedAdmin = assignedAdmin;
@@ -371,9 +405,6 @@ router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
-
-            // Also notify user generally
-            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', updatePayload);
 
             if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
         }

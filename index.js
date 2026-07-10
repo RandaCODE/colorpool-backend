@@ -13,6 +13,7 @@ const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
 const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage } = require("./models");
+const { createNotification } = require("./utils/notificationHelper");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -498,8 +499,28 @@ async function finalizeRound() {
                     }], { session });
                     winningPlayers.push({ username: bet.username, userId: bet.userId, betAmount: bet.amount, winningAmount: payoutKobo });
                     io.to(bet.userId).emit("balance_update", { balance: user.balance / 100 });
+
+                    // Notify WIN
+                    createNotification(io, {
+                        uid: bet.userId,
+                        title: 'You Won!',
+                        message: `Congratulations! Your bet on ${bet.color} won ₦${(payoutKobo / 100).toLocaleString()}.`,
+                        type: 'bet',
+                        priority: 'high',
+                        metadata: { roundId, winner, payout: payoutKobo / 100 }
+                    });
                 } else {
                     losingPlayers.push({ username: bet.username, userId: bet.userId, color: bet.color, betAmount: bet.amount });
+
+                    // Notify LOSS
+                    createNotification(io, {
+                        uid: bet.userId,
+                        title: 'Bet Result',
+                        message: `Your bet on ${bet.color} lost. The winning color was ${winner}.`,
+                        type: 'bet',
+                        priority: 'normal',
+                        metadata: { roundId, winner }
+                    });
                 }
                 if (bet.transactionId) {
                     await Transaction.updateOne({ _id: bet.transactionId }, { $set: { status: 'success', winningColor: winner, payout: payoutKobo } }).session(session);
@@ -647,6 +668,14 @@ app.get('/game-state', verifyToken, async (req, res) => {
         if (!user.balance && user.balance !== 0 && user.stats.totalBets === 0) {
             user.balance = 100000;
             await user.save();
+
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Welcome Bonus!',
+                message: 'Welcome to Color Pool! We have credited your wallet with ₦1,000 to get you started.',
+                type: 'bonus',
+                priority: 'high'
+            });
         }
         const history = await Round.find().sort({ createdAt: -1 }).limit(20);
         const response = await getGameResponse();
@@ -670,6 +699,15 @@ app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
             const b = await Bet.create([{ userId: req.user.uid, username, roundId: game.roundId, color, amount: kobo, transactionId: tx[0]._id }], { session });
             betObj = b[0];
             await pubClient.hIncrBy(`pools:${game.roundId}`, color, kobo);
+
+            // Notify Bet Placed
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Bet Placed',
+                message: `Your bet of ₦${amount.toLocaleString()} on ${color} has been placed.`,
+                type: 'bet',
+                metadata: { roundId: game.roundId, color, amount }
+            });
         });
         const mapped = mapBet(betObj);
         io.emit("new_bet", mapped);
@@ -682,6 +720,15 @@ app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
 app.post('/initialize-payment', verifyToken, validate(schemas.deposit), async (req, res) => {
     try {
         const r = await paystackAxios.post('/transaction/initialize', { email: req.body.email, amount: Math.floor(req.body.amount * 100), metadata: { userId: req.user.uid } }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } });
+
+        // Notify Deposit Initiated
+        createNotification(io, {
+            uid: req.user.uid,
+            title: 'Deposit Initiated',
+            message: `You have initiated a deposit of ₦${req.body.amount.toLocaleString()}. Please complete the payment.`,
+            type: 'deposit'
+        });
+
         res.json({ success: true, data: r.data.data });
     } catch (e) { res.status(500).json({ success: false }); }
 });
@@ -701,11 +748,30 @@ app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
                     const u = await User.findOneAndUpdate({ userId }, { $inc: { balance: amount, totalDeposited: amount } }, { session, new: true });
                     bal = u.balance;
                     await Transaction.create([{ userId, type: 'deposit', amount, balanceAfter: u.balance, status: 'success', reference: req.params.reference }], { session });
+
+                    // Notify Deposit Successful
+                    createNotification(io, {
+                        uid: userId,
+                        title: 'Deposit Successful',
+                        message: `₦${(amount / 100).toLocaleString()} has been credited to your wallet.`,
+                        type: 'deposit',
+                        priority: 'high'
+                    });
                 });
                 adminIo.emit("stats_update");
                 res.json({ success: true, data: { balance: bal / 100 } });
             } finally { session.endSession(); }
-        } else res.status(400).json({ success: false });
+        } else {
+            // Notify Deposit Failed
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Deposit Failed',
+                message: `Your deposit attempt with reference ${req.params.reference} was not successful.`,
+                type: 'deposit',
+                priority: 'normal'
+            });
+            res.status(400).json({ success: false });
+        }
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
@@ -787,6 +853,15 @@ app.post('/claim-bonus', verifyToken, async (req, res) => {
             if (!u) throw new Error("Already claimed");
             bal = u.balance;
             await Transaction.create([{ userId: req.user.uid, type: 'bonus', amount: 10000, balanceAfter: u.balance }], { session });
+
+            // Notify Bonus Claimed
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Daily Bonus!',
+                message: '₦100 has been added to your wallet as a daily bonus.',
+                type: 'bonus',
+                priority: 'normal'
+            });
         });
         adminIo.emit("stats_update");
         res.json({ success: true, data: { balance: bal / 100 } });
@@ -803,6 +878,15 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
             if (!u) throw new Error("Insufficient funds");
             const resTx = await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body.bankDetails }], { session });
             tx = resTx[0];
+
+            // Notify Withdrawal Submitted
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Withdrawal Submitted',
+                message: `Your withdrawal request for ₦${req.body.amount.toLocaleString()} has been received and is pending review.`,
+                type: 'withdrawal',
+                priority: 'normal'
+            });
         });
         adminIo.emit("new_withdrawal", mapTx(tx));
         adminIo.emit("stats_update");
@@ -965,10 +1049,28 @@ app.post('/admin/withdrawal-action', verifyAdmin, validate(schemas.adminAction),
             if (action === 'approve') {
                 tx.status = 'success';
                 await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { totalWithdrawn: Math.abs(tx.amount) } }, { session });
+
+                // Notify Withdrawal Approved
+                createNotification(io, {
+                    uid: tx.userId,
+                    title: 'Withdrawal Approved',
+                    message: `Your withdrawal for ₦${(Math.abs(tx.amount) / 100).toLocaleString()} has been approved.`,
+                    type: 'withdrawal',
+                    priority: 'high'
+                });
             } else {
                 tx.status = 'rejected';
                 const u = await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { balance: Math.abs(tx.amount) } }, { session, new: true });
                 await Transaction.create([{ userId: tx.userId, type: 'refund', amount: Math.abs(tx.amount), balanceAfter: u.balance, status: 'success', description: `Refund: Rejected withdrawal` }], { session });
+
+                // Notify Withdrawal Rejected
+                createNotification(io, {
+                    uid: tx.userId,
+                    title: 'Withdrawal Rejected',
+                    message: `Your withdrawal request was rejected. The funds have been returned to your wallet. Reason: ${notes || 'Not specified'}`,
+                    type: 'withdrawal',
+                    priority: 'high'
+                });
             }
             tx.adminNotes = notes;
             tx.processedBy = req.user.uid;
@@ -1008,6 +1110,18 @@ app.post('/admin/user/toggle-flag', verifyAdmin, async (req, res) => {
         if (!user) return res.status(404).json({ success: false });
         user.isFlagged = !user.isFlagged;
         await user.save();
+
+        // Notify Account Status update if flagged
+        if (user.isFlagged) {
+            createNotification(io, {
+                uid: req.body.userId,
+                title: 'Account Restricted',
+                message: 'Your account has been flagged for review. Please contact support.',
+                type: 'account',
+                priority: 'high'
+            });
+        }
+
         res.json({ success: true, isFlagged: user.isFlagged });
     } catch (e) { res.status(500).json({ success: false }); }
 });
@@ -1021,6 +1135,15 @@ app.post('/admin/user/adjust-balance', verifyAdmin, validate(schemas.adjustBalan
             if (!user) throw new Error("User not found");
             await Transaction.create([{ userId: req.body.userId, type: kobo > 0 ? 'bonus' : 'adjustment', amount: kobo, balanceAfter: user.balance, description: `Admin Adjustment: ${req.body.reason}`, processedBy: req.user.uid }], { session });
             io.to(req.body.userId).emit("balance_update", { balance: user.balance / 100 });
+
+            // Notify Wallet Adjusted
+            createNotification(io, {
+                uid: req.body.userId,
+                title: kobo > 0 ? 'Wallet Credited' : 'Wallet Debited',
+                message: `Your wallet has been ${kobo > 0 ? 'credited' : 'debited'} by ₦${(Math.abs(kobo) / 100).toLocaleString()}. Reason: ${req.body.reason}`,
+                type: 'wallet',
+                priority: 'high'
+            });
         });
         adminIo.emit("stats_update");
         res.json({ success: true });
