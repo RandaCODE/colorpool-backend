@@ -11,6 +11,7 @@ const userSchema = new mongoose.Schema({
   lastBonusClaimTime: { type: Date, default: null },
   isFlagged: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
+  kycStatus: { type: String, enum: ['none', 'pending', 'verified', 'rejected'], default: 'none' },
   lastLogin: { type: Date, default: Date.now },
   totalDeposited: { type: Number, default: 0 },
   totalWithdrawn: { type: Number, default: 0 },

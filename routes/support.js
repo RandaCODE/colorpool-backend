@@ -74,14 +74,18 @@ router.post('/create', verifyUser, async (req, res) => {
         if (req.io) {
             req.io.of('/admin/support').emit('new_ticket', ticket);
 
-            // Create notification using helper
+            // Notification: Ticket Created
             createNotification(req.io, {
                 uid: req.user.uid,
-                title: 'Ticket Created',
-                message: `Your support ticket ${ticket.ticketId} has been successfully created.`,
+                title: 'Ticket Created 📩',
+                body: `Your support ticket ${ticket.ticketId} has been successfully created.`,
                 type: 'support',
                 priority: 'normal',
-                metadata: { ticketId: ticket.ticketId }
+                route: '/support_chat',
+                payload: { ticketId: ticket.ticketId },
+                category: 'support',
+                icon: 'confirmation_number',
+                idempotencyKey: `ticket_created_${ticket.ticketId}`
             });
 
             if (req.emitSupportStats) req.emitSupportStats();
@@ -163,20 +167,15 @@ router.post('/ticket/:ticketId/reply', verifyUser, async (req, res) => {
         await ticket.save();
 
         if (req.io) {
-            // Real-time message
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
 
-            // Sync status
             if (oldStatus !== 'Open') {
                 const metaPayload = { ticketId: ticket.ticketId, status: ticket.status, priority: ticket.priority };
-                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', metaPayload);
                 req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', metaPayload);
-                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', metaPayload);
                 req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', metaPayload);
             }
 
-            // Notification for dashboard
             req.io.of('/admin/support').emit('ticket_update', {
                 ticketId: ticket.ticketId,
                 status: ticket.status,
@@ -261,7 +260,6 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
         const messages = await TicketMessage.find({ ticketId: ticket._id }).sort({ timestamp: 1 });
         const notes = await AdminNote.find({ ticketId: ticket._id }).sort({ createdAt: -1 });
 
-        // Mark user messages as read when admin opens the ticket
         const unreadUserMessages = messages.filter(m => m.senderType === 'User' && !m.read).map(m => m._id);
         if (unreadUserMessages.length > 0) {
             await TicketMessage.updateMany(
@@ -274,10 +272,7 @@ router.get('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
                     messageIds: unreadUserMessages.map(id => id.toString()),
                     readerType: 'Admin'
                 };
-                req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', receiptPayload);
                 req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('messageSeen', receiptPayload);
-                // Also notify other admins
-                req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messages_read_receipt', receiptPayload);
                 req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('messageSeen', receiptPayload);
             }
         }
@@ -321,37 +316,25 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
         await ticket.save();
 
         if (req.io) {
-            // Emit to specific ticket room in both namespaces
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('new_message', newMessage);
 
-            // Notification for user app
+            // Notification: Support Reply
             createNotification(req.io, {
                 uid: ticket.userId,
-                title: 'New Support Reply',
-                message: `An admin has replied to your ticket ${ticket.ticketId}.`,
+                title: 'Support Reply 🎧',
+                body: `An admin has replied to your ticket ${ticket.ticketId}.`,
                 type: 'support',
                 priority: 'high',
-                metadata: { ticketId: ticket.ticketId }
+                route: '/support_chat',
+                payload: { ticketId: ticket.ticketId },
+                category: 'support',
+                icon: 'support_agent',
+                idempotencyKey: `reply_${newMessage._id}`
             });
 
-            // Notification for user app if not in room (general support namespace)
-            req.io.of('/support').to(`user-support-${ticket.userId}`).emit('status_update', {
-                ticketId: ticket.ticketId,
-                status: ticket.status,
-                priority: ticket.priority,
-                lastMessage: message
-            });
-
-            // Meta update for everyone in the room
-            const updatePayload = {
-                ticketId: ticket.ticketId,
-                status: ticket.status,
-                priority: ticket.priority
-            };
-            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            const updatePayload = { ticketId: ticket.ticketId, status: ticket.status, priority: ticket.priority };
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
-            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
 
             if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
@@ -363,53 +346,63 @@ router.post('/admin/ticket/:ticketId/reply', verifyAdmin, async (req, res) => {
     }
 });
 
-router.patch('/admin/ticket/:ticketId', verifyAdmin, async (req, res) => {
+router.post('/admin/ticket/:ticketId/status', verifyAdmin, async (req, res) => {
     try {
-        const { status, priority, assignedAdmin } = req.body;
-
+        const { status } = req.body;
         const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
         if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
         const oldStatus = ticket.status;
+        ticket.status = status;
+        ticket.lastReplyAt = new Date();
 
-        if (status) {
-            ticket.status = status;
-            if (status === 'Closed' && oldStatus !== 'Closed') ticket.closedAt = new Date();
-            if (status === 'Resolved' && oldStatus !== 'Resolved') ticket.resolvedAt = new Date();
-
-            // Notify user of status change
-            if (status !== oldStatus && req.io) {
-                createNotification(req.io, {
-                    uid: ticket.userId,
-                    title: 'Ticket Status Updated',
-                    message: `Your support ticket ${ticket.ticketId} status has been changed to ${status}.`,
-                    type: 'support',
-                    priority: 'normal',
-                    metadata: { ticketId: ticket.ticketId, status }
-                });
-            }
-        }
-        if (priority) ticket.priority = priority;
-        if (assignedAdmin) ticket.assignedAdmin = assignedAdmin;
+        if (status === 'Resolved' && oldStatus !== 'Resolved') ticket.resolvedAt = new Date();
+        if (status === 'Closed' && oldStatus !== 'Closed') ticket.closedAt = new Date();
 
         await ticket.save();
 
         if (req.io) {
-            // Notify both namespaces about the status/priority update
-            const updatePayload = {
-                ticketId: ticket.ticketId,
-                status: ticket.status,
-                priority: ticket.priority
-            };
-            req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
+            const updatePayload = { ticketId: ticket.ticketId, status: ticket.status, priority: ticket.priority };
             req.io.of('/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
-            req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticket_meta_update', updatePayload);
             req.io.of('/admin/support').to(`ticket-${ticket.ticketId}`).emit('ticketStatusChanged', updatePayload);
+
+            // Notification: Ticket Status Update
+            createNotification(req.io, {
+                uid: ticket.userId,
+                title: `Ticket ${status} 🎫`,
+                body: `Your ticket ${ticket.ticketId} has been marked as ${status}.`,
+                type: 'support',
+                priority: 'normal',
+                route: '/support_chat',
+                payload: { ticketId: ticket.ticketId },
+                category: 'support',
+                icon: status === 'Closed' ? 'lock' : 'check_circle',
+                idempotencyKey: `ticket_status_${ticket.ticketId}_${status}`
+            });
 
             if (oldStatus !== ticket.status && req.emitSupportStats) req.emitSupportStats();
         }
 
-        res.json({ success: true, data: ticket });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/admin/ticket/:ticketId/note', verifyAdmin, async (req, res) => {
+    try {
+        const { note } = req.body;
+        const ticket = await SupportTicket.findOne({ ticketId: req.params.ticketId });
+        if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
+
+        const adminNote = new AdminNote({
+            ticketId: ticket._id,
+            adminId: req.admin.uid,
+            note
+        });
+
+        await adminNote.save();
+        res.json({ success: true, data: adminNote });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
