@@ -1,7 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
-const { User, Bonus, ReferralHistory, ReferralTransaction, Config } = require('../models');
+const { User, Bonus, ReferralHistory, ReferralTransaction, Config, Campaign } = require('../models');
+const { checkEligibility, claimCampaignReward } = require('../utils/campaignProcessor');
+const { convertBonusToMain, checkWithdrawalEligibility } = require('../utils/conversionProcessor');
 
 // Middleware to verify Firebase token
 async function verifyToken(req, res, next) {
@@ -35,24 +37,24 @@ router.get('/summary', verifyToken, async (req, res) => {
 });
 
 // @route   GET /bonuses/active
-// @desc    Get active/available bonuses
+// @desc    Get active/available bonuses including Promotional Campaigns
 router.get('/active', verifyToken, async (req, res) => {
     try {
         const userId = req.user.uid;
+        const now = new Date();
 
-        const bonusTypes = [
+        const activeBonuses = [];
+
+        // 1. Static Bonuses (Welcome, First Deposit)
+        const staticBonusTypes = [
             { type: 'WELCOME_BONUS', title: 'Welcome Bonus', description: 'Get a bonus for joining ColorPool!' },
             { type: 'FIRST_DEPOSIT_BONUS', title: 'First Deposit Bonus', description: 'Bonus on your first successful deposit.' }
         ];
 
-        const activeBonuses = [];
-
-        for (const b of bonusTypes) {
-            // Check if already claimed
+        for (const b of staticBonusTypes) {
             const claimed = await Bonus.findOne({ userId, bonusType: b.type, status: 'CLAIMED' });
             if (claimed) continue;
 
-            // Check if enabled in config
             const configKey = b.type.toLowerCase();
             const enabledConfig = await Config.findOne({ key: `${configKey}_enabled` });
             if (enabledConfig && enabledConfig.value === false) continue;
@@ -63,11 +65,12 @@ router.get('/active', verifyToken, async (req, res) => {
             activeBonuses.push({
                 ...b,
                 amount: amount / 100,
-                status: 'AVAILABLE'
+                status: 'AVAILABLE',
+                claimMethod: 'AUTO'
             });
         }
 
-        // Referral Rewards Integration
+        // 2. Referral Rewards Integration
         const pendingRefs = await ReferralHistory.find({ referrerId: userId, qualified: true, rewardPaid: false });
         if (pendingRefs.length > 0) {
             const refConfig = await Config.findOne({ key: 'referral_reward_amount' });
@@ -78,8 +81,35 @@ router.get('/active', verifyToken, async (req, res) => {
                 title: 'Referral Rewards',
                 description: `You have ${pendingRefs.length} qualified referral reward(s) pending.`,
                 amount: (refAmount * pendingRefs.length) / 100,
-                status: 'AVAILABLE'
+                status: 'AVAILABLE',
+                claimMethod: 'AUTO'
             });
+        }
+
+        // 3. Promotional Campaigns Integration (Phase 6)
+        const campaigns = await Campaign.find({
+            status: 'ACTIVE',
+            isActive: true,
+            startDate: { $lte: now },
+            endDate: { $gte: now }
+        }).sort({ priority: -1 });
+
+        for (const campaign of campaigns) {
+            const isEligible = await checkEligibility(userId, campaign);
+            if (isEligible) {
+                activeBonuses.push({
+                    id: campaign._id,
+                    campaignId: campaign.campaignId,
+                    type: 'CAMPAIGN_REWARD',
+                    title: campaign.name,
+                    description: campaign.description,
+                    amount: campaign.rewardAmount / 100,
+                    status: 'AVAILABLE',
+                    bannerUrl: campaign.bannerUrl,
+                    claimMethod: campaign.claimMethod,
+                    endDate: campaign.endDate
+                });
+            }
         }
 
         res.json({ success: true, data: activeBonuses });
@@ -88,8 +118,61 @@ router.get('/active', verifyToken, async (req, res) => {
     }
 });
 
+// @route   GET /bonuses/conversion-status
+// @desc    Get progress of bonuses being converted
+router.get('/conversion-status', verifyToken, async (req, res) => {
+    try {
+        const bonuses = await Bonus.find({
+            userId: req.user.uid,
+            status: 'CLAIMED',
+            conversionStatus: { $in: ['LOCKED', 'IN_PROGRESS', 'READY_TO_CONVERT'] }
+        }).sort({ createdAt: -1 });
+
+        res.json({
+            success: true,
+            data: bonuses.map(b => ({
+                id: b._id,
+                title: b.title,
+                amount: b.amount / 100,
+                status: b.conversionStatus,
+                progress: {
+                    wageringRequired: b.wageringRequired / 100,
+                    wageringAchieved: b.wageringAchieved / 100,
+                    percent: b.wageringRequired > 0 ? Math.min(100, (b.wageringAchieved / b.wageringRequired) * 100) : 100,
+                    roundsRequired: b.roundsRequired,
+                    roundsPlayed: b.roundsPlayed
+                }
+            }))
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// @route   POST /bonuses/convert/:bonusId
+// @desc    Convert a READY_TO_CONVERT bonus to Main Wallet
+router.post('/convert/:bonusId', verifyToken, async (req, res) => {
+    try {
+        const result = await convertBonusToMain(req.io, req.user.uid, req.params.bonusId);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+// @route   GET /bonuses/withdrawal-eligibility
+// @desc    Check if user is eligible to withdraw
+router.get('/withdrawal-eligibility', verifyToken, async (req, res) => {
+    try {
+        const result = await checkWithdrawalEligibility(req.user.uid);
+        res.json({ success: true, data: result });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // @route   GET /bonuses/history
-// @desc    Get bonus claim history (Unified Bonus History)
+// @desc    Get bonus claim and conversion history
 router.get('/history', verifyToken, async (req, res) => {
     try {
         const userId = req.user.uid;
@@ -107,8 +190,10 @@ router.get('/history', verifyToken, async (req, res) => {
                 title: h.title,
                 amount: h.amount / 100,
                 status: h.status,
+                conversionStatus: h.conversionStatus,
                 claimedAt: h.claimedAt,
-                transactionReference: h.transactionReference
+                convertedAt: h.convertedAt,
+                transactionReference: h.transactionReference || h.conversionReference
             })),
             ...refRewards.map(r => ({
                 id: r._id,

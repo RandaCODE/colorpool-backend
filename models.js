@@ -3,9 +3,53 @@ const SupportTicket = require('./models/SupportTicket');
 const TicketMessage = require('./models/TicketMessage');
 const AdminNote = require('./models/AdminNote');
 
+const campaignSchema = new mongoose.Schema({
+  campaignId: { type: String, required: true, unique: true, index: true },
+  name: { type: String, required: true },
+  description: { type: String },
+  bannerUrl: { type: String },
+  type: {
+    type: String,
+    enum: ['DEPOSIT_BONUS', 'CASHBACK_BONUS', 'WEEKEND_BONUS', 'HOLIDAY_BONUS', 'REFERRAL_CAMPAIGN', 'TOURNAMENT_BONUS', 'LOYALTY_BONUS', 'PROMOTIONAL', 'BIRTHDAY', 'SEASONAL'],
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['ACTIVE', 'SCHEDULED', 'ENDED', 'PAUSED', 'COMING_SOON', 'EXPIRED'],
+    default: 'SCHEDULED'
+  },
+  startDate: { type: Date, required: true },
+  endDate: { type: Date, required: true },
+  rewardAmount: { type: Number, default: 0 }, // Kobo
+  rewardType: { type: String, default: 'BONUS_WALLET' },
+  eligibilityRules: {
+    minDeposit: { type: Number, default: 0 },
+    maxDeposit: { type: Number, default: 0 },
+    minBets: { type: Number, default: 0 },
+    registrationDateAfter: { type: Date },
+    accountVerified: { type: Boolean, default: false },
+    referralCount: { type: Number, default: 0 },
+    birthdayClaimWindow: { type: Number, default: 0 } // Days before/after birthday
+  },
+  conversionRules: {
+    wageringMultiplier: { type: Number, default: 0 }, // e.g., 3x bonus amount
+    minRounds: { type: Number, default: 0 },
+    minStake: { type: Number, default: 0 }, // Minimum total stake required
+    expiryDays: { type: Number, default: 30 }
+  },
+  priority: { type: Number, default: 0 },
+  maxClaims: { type: Number, default: 0 }, // 0 for unlimited
+  currentClaims: { type: Number, default: 0 },
+  termsAndConditions: { type: String },
+  claimMethod: { type: String, enum: ['AUTO', 'CLAIM_BUTTON'], default: 'AUTO' },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
 const bonusSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
-  bonusType: { type: String, required: true }, // e.g., 'WELCOME_BONUS', 'FIRST_DEPOSIT_BONUS', 'REFERRAL_REWARD'
+  bonusType: { type: String, required: true },
+  campaignId: { type: String, index: true },
   title: { type: String, required: true },
   description: { type: String },
   amount: { type: Number, required: true }, // Kobo
@@ -14,6 +58,19 @@ const bonusSchema = new mongoose.Schema({
     enum: ['AVAILABLE', 'CLAIMED', 'EXPIRED', 'COMING_SOON'],
     default: 'AVAILABLE'
   },
+  // Conversion Tracking
+  conversionStatus: {
+    type: String,
+    enum: ['LOCKED', 'IN_PROGRESS', 'READY_TO_CONVERT', 'CONVERTED', 'EXPIRED'],
+    default: 'LOCKED'
+  },
+  wageringRequired: { type: Number, default: 0 },
+  wageringAchieved: { type: Number, default: 0 },
+  roundsRequired: { type: Number, default: 0 },
+  roundsPlayed: { type: Number, default: 0 },
+  conversionReference: { type: String, unique: true, sparse: true },
+  convertedAt: { type: Date },
+
   earnedAt: { type: Date, default: Date.now },
   claimedAt: { type: Date },
   expiresAt: { type: Date },
@@ -61,6 +118,7 @@ const configSchema = new mongoose.Schema({
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   email: { type: String, default: "user@example.com" },
+  dob: { type: Date }, // Date of Birth
   balance: { type: Number, default: 0 }, // KOBO
   playStreak: { type: Number, default: 0 },
   lastBonusClaimTime: { type: Date, default: null },
@@ -70,6 +128,9 @@ const userSchema = new mongoose.Schema({
   lastLogin: { type: Date, default: Date.now },
   totalDeposited: { type: Number, default: 0 },
   totalWithdrawn: { type: Number, default: 0 },
+  totalWagered: { type: Number, default: 0 }, // Total global wager volume (Kobo)
+  isWithdrawalRestricted: { type: Boolean, default: false },
+  withdrawalRestrictionReason: { type: String },
   stats: {
     totalBets: { type: Number, default: 0 },
     totalWins: { type: Number, default: 0 }
@@ -218,6 +279,7 @@ module.exports = {
   ReferralTransaction: mongoose.model('ReferralTransaction', referralTransactionSchema),
   Config: mongoose.model('Config', configSchema),
   Bonus: mongoose.model('Bonus', bonusSchema),
+  Campaign: mongoose.model('Campaign', campaignSchema),
   SupportTicket,
   TicketMessage,
   AdminNote

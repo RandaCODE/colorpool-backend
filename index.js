@@ -12,11 +12,12 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
-const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage, ReferralHistory, ReferralTransaction, Config, Bonus } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage, ReferralHistory, ReferralTransaction, Config, Bonus, Campaign } = require("./models");
 const { createNotification } = require("./utils/notificationHelper");
 const { generateReferralCode } = require("./utils/referralHelper");
 const { processReferralReward } = require("./utils/referralProcessor");
 const { awardBonus } = require("./utils/bonusProcessor");
+const { updateBonusProgress, checkWithdrawalEligibility } = require("./utils/conversionProcessor");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -486,6 +487,9 @@ async function finalizeRound() {
 
                 await Bet.updateOne({ _id: bet._id }, { $set: { settled: true, result: isWinner ? "WON" : "LOST", payout: payoutKobo } }).session(session);
 
+                // Update Bonus Progress for every settled bet (Win or Loss)
+                await updateBonusProgress(io, bet.userId, bet.amount);
+
                 if (isWinner) {
                     const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payoutKobo, "stats.totalWins": 1 } }, { session, new: true });
                     await Transaction.create([{
@@ -709,6 +713,7 @@ const mapTx = t => {
 app.use('/support', require('./routes/support'));
 app.use('/referral', require('./routes/referrals'));
 app.use('/bonuses', require('./routes/bonuses'));
+app.use('/campaigns', require('./routes/campaigns'));
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
@@ -1038,6 +1043,17 @@ app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) 
     const kobo = Math.floor(req.body.amount * 100);
     const session = await mongoose.startSession();
     try {
+        // Phase 8: Withdrawal Eligibility Check
+        const eligibility = await checkWithdrawalEligibility(req.user.uid);
+        if (!eligibility.eligible) {
+            return res.status(403).json({
+                success: false,
+                error: eligibility.reason,
+                status: eligibility.status,
+                details: eligibility.details
+            });
+        }
+
         let tx = null;
         await session.withTransaction(async () => {
             const u = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: kobo } }, { $inc: { balance: -kobo } }, { session, new: true });
@@ -1431,7 +1447,18 @@ async function initConfig() {
         { key: 'welcome_bonus_enabled', value: true, description: 'Enable Welcome Bonus for new users' },
         { key: 'welcome_bonus', value: 100000, description: 'Welcome Bonus amount in Kobo (₦1000)' },
         { key: 'first_deposit_bonus_enabled', value: true, description: 'Enable First Deposit Bonus' },
-        { key: 'first_deposit_bonus', value: 500000, description: 'First Deposit Bonus amount in Kobo (₦5000)' }
+        { key: 'first_deposit_bonus', value: 500000, description: 'First Deposit Bonus amount in Kobo (₦5000)' },
+
+        // Phase 8: Conversion & Withdrawal Rules
+        { key: 'restrict_withdrawal_with_active_bonus', value: false, description: 'Prevent withdrawal if user has locked bonuses' },
+        { key: 'min_deposit_wager_multiplier', value: 1, description: 'Required wagering multiplier of total deposits before withdrawal (Anti-Money Laundering)' },
+
+        // Default Wagering Requirements per type (can be overriden by campaigns)
+        { key: 'welcome_bonus_wagering_multiplier', value: 3, description: 'Wagering requirement multiplier for Welcome Bonus' },
+        { key: 'welcome_bonus_min_rounds', value: 5, description: 'Minimum rounds required for Welcome Bonus' },
+        { key: 'first_deposit_bonus_wagering_multiplier', value: 5, description: 'Wagering requirement multiplier for First Deposit Bonus' },
+        { key: 'first_deposit_bonus_min_rounds', value: 10, description: 'Minimum rounds required for First Deposit Bonus' },
+        { key: 'referral_reward_wagering_multiplier', value: 0, description: 'Wagering requirement multiplier for Referral Rewards' }
     ];
 
     for (const conf of defaultConfig) {
