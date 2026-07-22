@@ -3,6 +3,61 @@ const SupportTicket = require('./models/SupportTicket');
 const TicketMessage = require('./models/TicketMessage');
 const AdminNote = require('./models/AdminNote');
 
+const bonusSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  bonusType: { type: String, required: true }, // e.g., 'WELCOME_BONUS', 'FIRST_DEPOSIT_BONUS', 'REFERRAL_REWARD'
+  title: { type: String, required: true },
+  description: { type: String },
+  amount: { type: Number, required: true }, // Kobo
+  status: {
+    type: String,
+    enum: ['AVAILABLE', 'CLAIMED', 'EXPIRED', 'COMING_SOON'],
+    default: 'AVAILABLE'
+  },
+  earnedAt: { type: Date, default: Date.now },
+  claimedAt: { type: Date },
+  expiresAt: { type: Date },
+  transactionReference: { type: String, unique: true, sparse: true },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const referralHistorySchema = new mongoose.Schema({
+  referrerId: { type: String, required: true, index: true },
+  referredUserId: { type: String, required: true, unique: true },
+  referredUsername: { type: String },
+  status: {
+    type: String,
+    enum: ['INVITED', 'REGISTERED', 'FIRST_DEPOSIT_COMPLETED', 'GAMEPLAY_REQUIREMENT_COMPLETED', 'QUALIFIED', 'REWARD_PAID'],
+    default: 'REGISTERED'
+  },
+  wagerVolume: { type: Number, default: 0 }, // Kobo
+  qualified: { type: Boolean, default: false },
+  rewardPending: { type: Boolean, default: false },
+  rewardAmount: { type: Number, default: 0 },
+  rewardPaid: { type: Boolean, default: false },
+  rewardPaidAt: { type: Date },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const referralTransactionSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  referredUserId: { type: String },
+  referredUsername: { type: String },
+  amount: { type: Number, required: true }, // Kobo
+  status: { type: String, default: 'success' },
+  reason: { type: String, default: 'Referral Reward' },
+  paidAt: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const configSchema = new mongoose.Schema({
+  key: { type: String, unique: true, required: true },
+  value: mongoose.Schema.Types.Mixed,
+  description: String,
+  updatedAt: { type: Date, default: Date.now }
+});
+
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   email: { type: String, default: "user@example.com" },
@@ -19,7 +74,24 @@ const userSchema = new mongoose.Schema({
     totalBets: { type: Number, default: 0 },
     totalWins: { type: Number, default: 0 }
   },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+
+  // Referral Fields
+  referralCode: { type: String, unique: true, sparse: true, index: true },
+  referredBy: { type: String, index: true },
+  referralStatus: { type: String, default: 'REGISTERED' },
+  totalReferrals: { type: Number, default: 0 },
+  qualifiedReferrals: { type: Number, default: 0 },
+  pendingReferrals: { type: Number, default: 0 },
+  referralWallet: { type: Number, default: 0 }, // Dedicated Referral Wallet (Kobo)
+  totalReferralEarnings: { type: Number, default: 0 },
+  pendingReferralRewards: { type: Number, default: 0 },
+  qualifiedReferralRewards: { type: Number, default: 0 },
+
+  // Bonus Fields
+  bonusWallet: { type: Number, default: 0 },
+  totalBonusEarned: { type: Number, default: 0 },
+  totalClaimedBonuses: { type: Number, default: 0 }
 });
 
 const betSchema = new mongoose.Schema({
@@ -142,6 +214,10 @@ module.exports = {
   Round: mongoose.model('Round', roundSchema),
   RoundHistory: mongoose.model('Round', roundSchema), // Alias
   GlobalState: mongoose.model('GlobalState', globalStateSchema),
+  ReferralHistory: mongoose.model('ReferralHistory', referralHistorySchema),
+  ReferralTransaction: mongoose.model('ReferralTransaction', referralTransactionSchema),
+  Config: mongoose.model('Config', configSchema),
+  Bonus: mongoose.model('Bonus', bonusSchema),
   SupportTicket,
   TicketMessage,
   AdminNote

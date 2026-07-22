@@ -12,8 +12,11 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const { createClient } = require("redis");
 const Joi = require('joi');
-const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage } = require("./models");
+const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage, ReferralHistory, ReferralTransaction, Config, Bonus } = require("./models");
 const { createNotification } = require("./utils/notificationHelper");
+const { generateReferralCode } = require("./utils/referralHelper");
+const { processReferralReward } = require("./utils/referralProcessor");
+const { awardBonus } = require("./utils/bonusProcessor");
 
 // Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -533,6 +536,45 @@ async function finalizeRound() {
                 if (bet.transactionId) {
                     await Transaction.updateOne({ _id: bet.transactionId }, { $set: { status: 'success', winningColor: winner, payout: payoutKobo } }).session(session);
                 }
+
+                // Phase 2: Referral Gameplay Tracking
+                const referral = await ReferralHistory.findOne({ referredUserId: bet.userId, status: 'FIRST_DEPOSIT_COMPLETED' }).session(session);
+                if (referral) {
+                    referral.wagerVolume += bet.amount;
+                    const gameplayConfig = await Config.findOne({ key: 'min_gameplay_requirement' }).session(session);
+                    const requiredGameplay = gameplayConfig ? gameplayConfig.value : 500000;
+
+                    if (referral.wagerVolume >= requiredGameplay) {
+                        referral.status = 'QUALIFIED';
+                        referral.qualified = true;
+                        referral.rewardPending = true;
+
+                        // Notify Referrer
+                        createNotification(io, {
+                            uid: referral.referrerId,
+                            title: 'Referral Qualified 👥',
+                            body: 'Your referred user has completed all qualification requirements. Your referral reward is now pending release.',
+                            type: 'referral',
+                            priority: 'high',
+                            category: 'social',
+                            icon: 'verified',
+                            idempotencyKey: `ref_qualified_${bet.userId}`
+                        });
+
+                        // Update User Referral Status
+                        await User.findOneAndUpdate(
+                            { userId: referral.referrerId },
+                            { $inc: { qualifiedReferrals: 1, pendingReferrals: -1 } }
+                        ).session(session);
+
+                        await referral.save({ session });
+
+                        // Phase 3: Trigger Reward Processing
+                        await processReferralReward(io, bet.userId, session);
+                    } else {
+                        await referral.save({ session });
+                    }
+                }
             }
 
             const houseProfitKobo = totalBetsKobo - totalPayoutKobo;
@@ -665,34 +707,77 @@ const mapTx = t => {
 // =======================
 
 app.use('/support', require('./routes/support'));
+app.use('/referral', require('./routes/referrals'));
+app.use('/bonuses', require('./routes/bonuses'));
 
 app.get('/game-state', verifyToken, async (req, res) => {
     try {
-        const user = await User.findOneAndUpdate(
-            { userId: req.user.uid },
-            { $set: { lastLogin: new Date() } },
-            { upsert: true, new: true, setDefaultsOnInsert: true }
-        );
-        if (!user.balance && user.balance !== 0 && user.stats.totalBets === 0) {
-            user.balance = 100000;
+        let user = await User.findOne({ userId: req.user.uid });
+        const isNewUser = !user;
+
+        if (isNewUser) {
+            const referralCode = await generateReferralCode();
+            let referredBy = null;
+
+            // Handle referral from query or body if provided during initialization
+            const refCode = req.query.ref || req.body.ref;
+            if (refCode) {
+                const referrer = await User.findOne({ referralCode: refCode.toUpperCase() });
+                if (referrer && referrer.userId !== req.user.uid) {
+                    referredBy = referrer.userId;
+
+                    // Update Referrer
+                    await User.findOneAndUpdate(
+                        { userId: referrer.userId },
+                        { $inc: { totalReferrals: 1, pendingReferrals: 1 } }
+                    );
+
+                    // Create Referral History
+                    await ReferralHistory.create({
+                        referrerId: referrer.userId,
+                        referredUserId: req.user.uid,
+                        referredUsername: req.user.email?.split('@')[0] || 'User',
+                        status: 'REGISTERED'
+                    });
+
+                    // Notify Referrer
+                    createNotification(io, {
+                        uid: referrer.userId,
+                        title: 'New Referral Joined 👥',
+                        body: 'A new user has registered using your referral code. They need to complete the qualification requirements before your referral reward becomes available.',
+                        type: 'referral',
+                        priority: 'normal',
+                        category: 'social',
+                        icon: 'person_add',
+                        idempotencyKey: `ref_join_${req.user.uid}`
+                    });
+                }
+            }
+
+            user = new User({
+                userId: req.user.uid,
+                email: req.user.email || "user@example.com",
+                referralCode,
+                referredBy,
+                balance: 0,
+                stats: { totalBets: 0, totalWins: 0 }
+            });
             await user.save();
 
-            createNotification(io, {
-                uid: req.user.uid,
-                title: 'Welcome Bonus! 🎁',
-                body: 'Welcome to Color Pool! We have credited your wallet with ₦1,000 to get you started.',
-                type: 'bonus',
-                priority: 'high',
-                route: '/wallet',
-                category: 'promo',
-                icon: 'card_giftcard',
-                idempotencyKey: `welcome_${req.user.uid}`
-            });
+            // Phase 5: Award Welcome Bonus for new users
+            await awardBonus(io, req.user.uid, 'WELCOME_BONUS');
+        } else {
+            user.lastLogin = new Date();
+            await user.save();
         }
+
         const history = await Round.find().sort({ createdAt: -1 }).limit(20);
         const response = await getGameResponse();
         res.json({ success: true, data: { ...response, balance: user.balance / 100, colorHistory: history.map(r => r.winner), playStreak: user.playStreak, canClaimBonus: !user.lastBonusClaimTime || (new Date() - user.lastBonusClaimTime > 86400000) } });
-    } catch (e) { res.status(500).json({ success: false }); }
+    } catch (e) {
+        console.error("Game-state error:", e);
+        res.status(500).json({ success: false });
+    }
 });
 
 app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
@@ -773,6 +858,43 @@ app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
                         bal = u.balance;
                         return;
                     }
+
+                    // Phase 2: Referral First Deposit Check
+                    const user = await User.findOne({ userId }).session(session);
+                    if (user && user.totalDeposited === 0) {
+                        // Phase 5: Award First Deposit Bonus
+                        await awardBonus(io, userId, 'FIRST_DEPOSIT_BONUS', session);
+
+                        const depositConfig = await Config.findOne({ key: 'min_referral_deposit' }).session(session);
+                        const minDeposit = depositConfig ? depositConfig.value : 500000;
+
+                        if (amount >= minDeposit) {
+                            const referral = await ReferralHistory.findOne({ referredUserId: userId, status: 'REGISTERED' }).session(session);
+                            if (referral) {
+                                referral.status = 'FIRST_DEPOSIT_COMPLETED';
+                                await referral.save({ session });
+
+                                // Phase 3: Check for qualification if gameplay requirement is met/0
+                                const gameplayConfig = await Config.findOne({ key: 'min_gameplay_requirement' }).session(session);
+                                const requiredGameplay = gameplayConfig ? gameplayConfig.value : 500000;
+
+                                if (referral.wagerVolume >= requiredGameplay) {
+                                    referral.status = 'QUALIFIED';
+                                    referral.qualified = true;
+                                    referral.rewardPending = true;
+                                    await referral.save({ session });
+
+                                    await User.findOneAndUpdate(
+                                        { userId: referral.referrerId },
+                                        { $inc: { qualifiedReferrals: 1, pendingReferrals: -1 } }
+                                    ).session(session);
+
+                                    await processReferralReward(io, userId, session);
+                                }
+                            }
+                        }
+                    }
+
                     const u = await User.findOneAndUpdate({ userId }, { $inc: { balance: amount, totalDeposited: amount } }, { session, new: true });
                     bal = u.balance;
                     await Transaction.create([{ userId, type: 'deposit', amount, balanceAfter: u.balance, status: 'success', reference }], { session });
@@ -1295,5 +1417,35 @@ app.get('/admin/round-history', verifyAdmin, async (req, res) => {
     }
 });
 
-if (MONGO_URI) mongoose.connect(MONGO_URI).then(() => { console.log("✅ DB Connected"); startGameLoop(); });
+// Admin Configuration Initializer
+async function initConfig() {
+    const defaultConfig = [
+        { key: 'referral_enabled', value: true, description: 'Master switch for referral system' },
+        { key: 'referral_reward_amount', value: 100000, description: 'Reward amount in Kobo (e.g. 100000 = ₦1000)' },
+        { key: 'min_deposit_for_referral', value: 200000, description: 'Minimum deposit required for qualification (Kobo)' },
+        { key: 'referral_qualification_enabled', value: true, description: 'Whether users need to deposit to qualify' },
+        { key: 'min_referral_deposit', value: 500000, description: 'Minimum first deposit for referral qualification (₦5000)' },
+        { key: 'min_gameplay_requirement', value: 500000, description: 'Minimum gameplay volume for referral qualification (₦5000)' },
+
+        // Phase 5: Bonus Configurations
+        { key: 'welcome_bonus_enabled', value: true, description: 'Enable Welcome Bonus for new users' },
+        { key: 'welcome_bonus', value: 100000, description: 'Welcome Bonus amount in Kobo (₦1000)' },
+        { key: 'first_deposit_bonus_enabled', value: true, description: 'Enable First Deposit Bonus' },
+        { key: 'first_deposit_bonus', value: 500000, description: 'First Deposit Bonus amount in Kobo (₦5000)' }
+    ];
+
+    for (const conf of defaultConfig) {
+        await Config.findOneAndUpdate(
+            { key: conf.key },
+            { $setOnInsert: conf },
+            { upsert: true }
+        );
+    }
+}
+
+if (MONGO_URI) mongoose.connect(MONGO_URI).then(() => {
+    console.log("✅ DB Connected");
+    startGameLoop();
+    initConfig();
+});
 server.listen(PORT, () => console.log(`🚀 Server running`));
