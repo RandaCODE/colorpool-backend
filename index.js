@@ -253,6 +253,16 @@ io.on("connection", async (socket) => {
     const response = await getGameResponse();
     socket.emit("game_update", response);
 
+    // Keep player presence authoritative for every connected game client.
+    io.emit("players_online", { playersOnline: io.sockets.sockets.size });
+
+    socket.on("disconnect", () => {
+        // Socket.IO removes the socket before this callback runs.
+        setTimeout(() => {
+            io.emit("players_online", { playersOnline: io.sockets.sockets.size });
+        }, 0);
+    });
+
     // Initial admin presence for game app
     const adminSockets = await adminSupportIo.fetchSockets();
     socket.emit("adminOnlineStatus", adminSockets.length > 0);
@@ -429,8 +439,9 @@ async function getRedisPools(roundId) {
 
 async function getGameResponse() {
     const pools = await getRedisPools(game.roundId);
+    const playersOnline = io.sockets.sockets.size;
     const { serverSeed, forcedWinner, forcedBy, ...sanitized } = game;
-    return { ...sanitized, pools };
+    return { ...sanitized, pools, playersOnline };
 }
 
 async function getAdminAnalytics() {
