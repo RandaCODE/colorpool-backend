@@ -202,14 +202,16 @@ io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth.token || socket.handshake.query.token;
         if (!token) {
-            if (socket.handshake.query.userId) { socket.userId = socket.handshake.query.userId; return next(); }
+            // No credentials — still let the connection through for public
+            // broadcasts (game_update, round_result, new_bet), but socket.userId
+            // stays undefined so it can never join anyone's private room.
             return next();
         }
         const decodedToken = await admin.auth().verifyIdToken(token);
-        socket.userId = decodedToken.uid;
+        socket.userId = decodedToken.uid; // Verified — safe to room-join on.
         next();
     } catch (error) {
-        if (socket.handshake.query.userId) { socket.userId = socket.handshake.query.userId; return next(); }
+        // Invalid/expired token — same as "no credentials" above.
         next();
     }
 });
@@ -252,16 +254,6 @@ io.on("connection", async (socket) => {
     if (socket.userId) socket.join(socket.userId);
     const response = await getGameResponse();
     socket.emit("game_update", response);
-
-    // Keep player presence authoritative for every connected game client.
-    io.emit("players_online", { playersOnline: io.sockets.sockets.size });
-
-    socket.on("disconnect", () => {
-        // Socket.IO removes the socket before this callback runs.
-        setTimeout(() => {
-            io.emit("players_online", { playersOnline: io.sockets.sockets.size });
-        }, 0);
-    });
 
     // Initial admin presence for game app
     const adminSockets = await adminSupportIo.fetchSockets();
@@ -439,9 +431,8 @@ async function getRedisPools(roundId) {
 
 async function getGameResponse() {
     const pools = await getRedisPools(game.roundId);
-    const playersOnline = io.sockets.sockets.size;
     const { serverSeed, forcedWinner, forcedBy, ...sanitized } = game;
-    return { ...sanitized, pools, playersOnline };
+    return { ...sanitized, pools };
 }
 
 async function getAdminAnalytics() {
