@@ -274,5 +274,13 @@ module.exports = {
   Bet: mongoose.model('Bet', betSchema),
   Transaction: mongoose.model('Transaction', transactionSchema),
   GlobalState: mongoose.model('GlobalState', globalStateSchema),
-  Round: mongoose.model('Round', roundSchema)
+  Round: mongoose.model('Round', roundSchema),
+  Config: mongoose.model('Config', configSchema),
+  Campaign: mongoose.model('Campaign', campaignSchema),
+  Bonus: mongoose.model('Bonus', bonusSchema),
+  ReferralHistory: mongoose.model('ReferralHistory', referralHistorySchema),
+  ReferralTransaction: mongoose.model('ReferralTransaction', referralTransactionSchema),
+  SupportTicket,
+  TicketMessage,
+  AdminNote
 };
