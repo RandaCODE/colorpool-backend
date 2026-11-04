@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -6,54 +7,363 @@ const axios = require('axios');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 const http = require('http');
+const rateLimit = require('express-rate-limit');
 const { Server } = require("socket.io");
-const { User, Bet, Transaction, GlobalState } = require("./models");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const { createClient } = require("redis");
+const Joi = require('joi');
+const { User, Bet, Transaction, GlobalState, Round, SupportTicket, TicketMessage, ReferralHistory, ReferralTransaction, Config, Bonus, Campaign } = require("./models");
+const { createNotification } = require("./utils/notificationHelper");
+const { generateReferralCode } = require("./utils/referralHelper");
+const { processReferralReward } = require("./utils/referralProcessor");
+const { awardBonus } = require("./utils/bonusProcessor");
+const { updateBonusProgress, checkWithdrawalEligibility } = require("./utils/conversionProcessor");
 
-// 1. Force stable DNS for MongoDB Atlas
+// Force stable DNS for MongoDB Atlas
 dns.setServers(['8.8.8.8', '8.8.4.4']);
+
+// CONFIG
+const PORT = process.env.PORT || 3000;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const MONGO_URI = process.env.MONGO_URI;
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const INSTANCE_ID = crypto.randomBytes(8).toString('hex');
+
+// External APIs
+const paystackAxios = axios.create({
+    baseURL: 'https://api.paystack.co',
+    timeout: 30000,
+});
+
+// =======================
+// LEADER ELECTION STATE
+// =======================
+let isMaster = false;
+
+// =======================
+// REDIS SETUP
+// =======================
+const pubClient = createClient({ url: REDIS_URL });
+const subClient = pubClient.duplicate();
+const stateSubClient = pubClient.duplicate();
+
+// Error listeners to capture and log any Redis client exceptions
+[pubClient, subClient, stateSubClient].forEach(client => {
+    client.on('error', (err) => console.error("❌ Redis Client Exception:", err));
+});
+
+async function electLeader() {
+    const lockKey = 'game_master_lock';
+    const ttl = 5000;
+    try {
+        const result = await pubClient.set(lockKey, INSTANCE_ID, { PX: ttl, NX: true });
+        if (result === 'OK') {
+            if (!isMaster) console.log(`👑 [${INSTANCE_ID}] Elected as GAME MASTER`);
+            isMaster = true;
+        } else {
+            const currentLockOwner = await pubClient.get(lockKey);
+            if (currentLockOwner === INSTANCE_ID) {
+                await pubClient.pExpire(lockKey, ttl);
+                isMaster = true;
+            } else {
+                if (isMaster) console.log(`🛰 [${INSTANCE_ID}] Stepping down to REPLICA (New Master: ${currentLockOwner})`);
+                isMaster = false;
+            }
+        }
+    } catch (e) { isMaster = false; }
+}
+
+async function initRedis() {
+    try {
+        await Promise.all([pubClient.connect(), subClient.connect(), stateSubClient.connect()]);
+        console.log(`✅ Redis Connected`);
+        await stateSubClient.subscribe('game_state_updates', (message) => {
+            if (!isMaster) {
+                const updatedGame = JSON.parse(message);
+                if (game.roundId !== updatedGame.roundId || Math.abs(game.time - updatedGame.time) > 1) {
+                    game = updatedGame;
+                } else {
+                    game.time = updatedGame.time;
+                    game.status = updatedGame.status;
+                    game.bettingLocked = updatedGame.bettingLocked;
+                    game.winner = updatedGame.winner;
+                    game.forcedWinner = updatedGame.forcedWinner;
+                    game.forcedBy = updatedGame.forcedBy;
+                    game.isForced = updatedGame.isForced;
+                    game.timeline = updatedGame.timeline;
+                    game.riskSnapshot = updatedGame.riskSnapshot;
+                }
+            }
+        });
+        setInterval(electLeader, 2000);
+        await electLeader();
+    } catch (e) {
+        console.error("❌ Redis Initialization Failed. Full Details:");
+        console.error(e);
+    }
+}
+initRedis();
 
 // =======================
 // FIREBASE ADMIN SETUP
 // =======================
 let firebaseConfigured = false;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    try {
-        if (admin.apps.length === 0) {
-            const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
-            });
-        }
-        console.log("✅ Firebase initialized via ENV");
-        firebaseConfigured = true;
-    } catch (error) {
-        console.error("❌ Firebase init error:", error.message);
+try {
+    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+        : require("./serviceAccountKey.json");
+    if (admin.apps.length === 0) {
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     }
-} else {
-    try {
-        const serviceAccount = require("./serviceAccountKey.json");
-        if (admin.apps.length === 0) {
-            admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-        }
-        console.log("✅ Firebase initialized via local file");
-        firebaseConfigured = true;
-    } catch (e) {
-        console.warn("⚠️ Firebase credentials not found locally.");
-    }
-}
+    firebaseConfigured = true;
+} catch (error) { console.error("❌ Firebase Init Error:", error.message); }
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+app.set('trust proxy', 1);
+
+const io = new Server(server, {
+    cors: { origin: "*" },
+    pingTimeout: 60000,
+    adapter: createAdapter(pubClient, subClient)
+});
+
+// Namespaces
+const adminIo = io.of("/admin");
+const supportIo = io.of("/support");
+const adminSupportIo = io.of("/admin/support");
+
+// Helper to emit support statistics
+async function emitSupportStats() {
+    try {
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+        const openTickets = await SupportTicket.countDocuments({ status: 'Open' });
+        const pendingTickets = await SupportTicket.countDocuments({ status: 'Pending' });
+        const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
+        const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
+
+        const stats = { open: openTickets, pending: pendingTickets, resolvedToday, closedToday };
+        // Support Stats Updates
+        adminSupportIo.emit('support_stats_update', stats);
+        adminSupportIo.emit('ticketStatsUpdated', stats); // User requested name
+
+        // General Admin Dashboard Refresh
+        adminIo.emit('stats_update');
+
+        return stats;
+    } catch (e) {
+        console.error("Error emitting support stats:", e);
+    }
+}
 
 // =======================
-// CONFIGURATION
+// JOI VALIDATION
 // =======================
-const PORT = process.env.PORT || 3000;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-console.log("PAYSTACK KEY EXISTS:", !!PAYSTACK_SECRET_KEY);
+const schemas = {
+    bet: Joi.object({
+        color: Joi.string().valid('green', 'purple', 'blue').required(),
+        amount: Joi.number().min(100).max(1000000).required(),
+        idempotencyKey: Joi.string().max(128).allow('').optional()
+    }),
+    withdraw: Joi.object({
+        amount: Joi.number().min(2000).max(500000).required(),
+        bankDetails: Joi.object({
+            bankName: Joi.string().required(),
+            accountNumber: Joi.string().pattern(/^\d+$/).min(10).max(10).required(),
+            bankCode: Joi.string().required(),
+            accountName: Joi.string().required()
+        }).required()
+    }),
+    deposit: Joi.object({
+        email: Joi.string().email().required(),
+        amount: Joi.number().min(100).max(500000).required()
+    }),
+    adminAction: Joi.object({
+        transactionId: Joi.string().required(),
+        action: Joi.string().valid('approve', 'reject').required(),
+        notes: Joi.string().allow('').max(500)
+    }),
+    adjustBalance: Joi.object({
+        userId: Joi.string().required(),
+        amount: Joi.number().required(),
+        reason: Joi.string().required().max(100)
+    })
+};
 
-const MONGO_URI = process.env.MONGO_URI;
+const validate = (schema) => (req, res, next) => {
+    const { error } = schema.validate(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+    next();
+};
+
+// =======================
+// SOCKET AUTH
+// =======================
+io.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+        if (!token) return next(new Error("Unauthorized: Missing authentication token"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        if (!decodedToken?.uid) return next(new Error("Unauthorized: Invalid token payload"));
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) {
+        next(new Error("Unauthorized: Token verification failed"));
+    }
+});
+
+adminIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return next(new Error("Forbidden"));
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
+supportIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
+adminSupportIo.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth.token || socket.handshake.query.token;
+        if (!token) return next(new Error("Unauthorized"));
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return next(new Error("Forbidden"));
+        socket.userId = decodedToken.uid;
+        next();
+    } catch (error) { next(new Error("Unauthorized")); }
+});
+
+io.on("connection", async (socket) => {
+    if (socket.userId) socket.join(socket.userId);
+    const response = await getGameResponse();
+    socket.emit("game_update", response);
+
+    // Keep player presence authoritative for every connected game client.
+    io.emit("players_online", { playersOnline: io.sockets.sockets.size });
+
+    socket.on("disconnect", () => {
+        // Socket.IO removes the socket before this callback runs.
+        setTimeout(() => {
+            io.emit("players_online", { playersOnline: io.sockets.sockets.size });
+        }, 0);
+    });
+
+    // Initial admin presence for game app
+    const adminSockets = await adminSupportIo.fetchSockets();
+    socket.emit("adminOnlineStatus", adminSockets.length > 0);
+});
+
+adminIo.on("connection", async (socket) => {
+    const response = await getGameResponse();
+    const analytics = await getAdminAnalytics();
+    socket.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
+    emitSupportStats();
+});
+
+// Support Namespaces Handlers
+supportIo.on("connection", async (socket) => {
+    if (socket.userId) socket.join(`user-support-${socket.userId}`);
+    console.log(`Support user connected: ${socket.userId}`);
+
+    socket.on("join_ticket", (ticketId) => {
+        socket.join(`ticket-${ticketId}`);
+        console.log(`User joined ticket room: ticket-${ticketId}`);
+    });
+
+    socket.on("typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("typing", { type: "Customer", ticketId: data.ticketId });
+    });
+
+    socket.on("stop_typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Customer", ticketId: data.ticketId });
+    });
+
+    socket.on("messageSeen", async (data) => {
+        const { ticketId, messageIds } = data;
+        try {
+            await TicketMessage.updateMany(
+                { _id: { $in: messageIds }, senderType: 'Admin' },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            // Notify Admin side
+            const payload = { ticketId, messageIds, readerType: 'User' };
+            adminSupportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", payload);
+            adminSupportIo.to(`ticket-${ticketId}`).emit("messageSeen", payload);
+        } catch (e) { console.error("Error in messageSeen:", e); }
+    });
+
+    // Notify user of support presence immediately
+    const adminSockets = await adminSupportIo.fetchSockets();
+    const isOnline = adminSockets.length > 0;
+    socket.emit("support_presence", { online: isOnline, lastSeen: new Date() });
+    socket.emit(isOnline ? "adminOnline" : "adminOffline");
+});
+
+adminSupportIo.on("connection", async (socket) => {
+    socket.join("admin-support-room");
+    console.log(`Support admin connected: ${socket.userId}`);
+
+    // Notify all users and namespaces that an admin is online
+    const presenceData = { online: true, lastSeen: new Date() };
+    supportIo.emit("support_presence", presenceData);
+    supportIo.emit("adminOnline");
+    io.emit("adminOnline");
+    io.emit("adminOnlineStatus", true);
+
+    socket.on("join_ticket", (ticketId) => {
+        socket.join(`ticket-${ticketId}`);
+        console.log(`Admin joined ticket room: ticket-${ticketId}`);
+    });
+
+    socket.on("typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("typing", { type: "Admin", ticketId: data.ticketId });
+    });
+
+    socket.on("stop_typing", (data) => {
+        socket.to(`ticket-${data.ticketId}`).emit("stop_typing", { type: "Admin", ticketId: data.ticketId });
+    });
+
+    socket.on("messageSeen", async (data) => {
+        const { ticketId, messageIds } = data;
+        try {
+            await TicketMessage.updateMany(
+                { _id: { $in: messageIds }, senderType: 'User' },
+                { $set: { read: true, readAt: new Date() } }
+            );
+            // Notify User side
+            const payload = { ticketId, messageIds, readerType: 'Admin' };
+            supportIo.to(`ticket-${ticketId}`).emit("messages_read_receipt", payload);
+            supportIo.to(`ticket-${ticketId}`).emit("messageSeen", payload);
+        } catch (e) { console.error("Error in messageSeen (admin):", e); }
+    });
+
+    socket.on("disconnect", async () => {
+        // Wait briefly for socket list to update
+        setTimeout(async () => {
+            const adminSockets = await adminSupportIo.fetchSockets();
+            if (adminSockets.length === 0) {
+                const offlineData = { online: false, lastSeen: new Date() };
+                supportIo.emit("support_presence", offlineData);
+                supportIo.emit("adminOffline");
+                io.emit("adminOffline");
+                io.emit("adminOnlineStatus", false);
+            }
+        }, 1000);
+    });
+});
 
 // =======================
 // MIDDLEWARE
@@ -61,39 +371,43 @@ const MONGO_URI = process.env.MONGO_URI;
 app.use(cors());
 app.use(express.json());
 
-// Logger for debugging
+// Inject io and stats helper into request
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    req.io = io;
+    req.emitSupportStats = emitSupportStats;
     next();
 });
 
-// =======================
-// DEBUG ROUTES
-// =======================
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'Backend live'
-  });
-});
+async function verifyToken(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
+        const decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+        req.user = decodedToken;
+        next();
+    } catch (error) { return res.status(401).json({ success: false, error: 'Invalid session' }); }
+}
 
-app.get('/test-paystack', (req, res) => {
-  res.json({
-    success: true,
-    hasKey: !!process.env.PAYSTACK_SECRET_KEY
-  });
-});
+async function verifyAdmin(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
+        const decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+        const user = await User.findOne({ userId: decodedToken.uid });
+        if (!user || !user.isAdmin) return res.status(403).json({ success: false, error: 'Forbidden' });
+        req.user = decodedToken;
+        next();
+    } catch (error) { return res.status(401).json({ success: false, error: 'Invalid session' }); }
+}
 
-// PROVABLY FAIR CONSTANTS
-const PROBABILITIES = { green: 0.52, purple: 0.28, blue: 0.20 };
+// =======================
+// GAME ENGINE
+// =======================
 const multipliers = { green: 2, purple: 3, blue: 5 };
 const ROUND_TIME = 30;
 const LOCK_AT = 10;
 const RESULT_AT = 5;
 
-// =======================
-// ENGINE STATE
-// =======================
 let game = {
     roundId: `R-${Date.now()}`,
     time: ROUND_TIME,
@@ -103,340 +417,1168 @@ let game = {
     serverSeed: null,
     serverSeedHash: null,
     clientSeed: `CLIENT_${Date.now()}`,
-    pools: { green: 0, purple: 0, blue: 0 }
+    forcedWinner: null,
+    forcedBy: null,
+    forcedAt: null,
+    forcedReason: null,
+    isForced: false,
+    timeline: { startedAt: new Date(), lockedAt: null, resultAt: null, completedAt: null },
+    riskSnapshot: null
 };
 
-let secretCalculatedWinner = null;
-
-// =======================
-// PROVABLY FAIR LOGIC
-// =======================
-
-function generateServerSeed() {
-    return crypto.randomBytes(32).toString('hex');
+async function getRedisPools(roundId) {
+    const data = await pubClient.hGetAll(`pools:${roundId}`);
+    return {
+        green: (parseInt(data.green || 0) / 100),
+        purple: (parseInt(data.purple || 0) / 100),
+        blue: (parseInt(data.blue || 0) / 100)
+    };
 }
 
-function hashSeed(seed) {
-    return crypto.createHash('sha256').update(seed).digest('hex');
+async function getGameResponse() {
+    const pools = await getRedisPools(game.roundId);
+    const playersOnline = io.sockets.sockets.size;
+    const { serverSeed, forcedWinner, forcedBy, ...sanitized } = game;
+    return { ...sanitized, pools, playersOnline };
 }
 
-function provablyFairRandom(serverSeed, clientSeed, roundId) {
-    const combined = `${serverSeed}:${clientSeed}:${roundId}`;
-    const hash = crypto.createHash('sha256').update(combined).digest('hex');
-    const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
+async function getAdminAnalytics() {
+    const pools = await getRedisPools(game.roundId);
+    const greenKobo = Math.floor(pools.green * 100);
+    const purpleKobo = Math.floor(pools.purple * 100);
+    const blueKobo = Math.floor(pools.blue * 100);
+    const totalPool = greenKobo + purpleKobo + blueKobo;
 
-    if (num < PROBABILITIES.green) return "green";
-    if (num < (PROBABILITIES.green + PROBABILITIES.purple)) return "purple";
-    return "blue";
-}
-
-function determineWinner(serverSeed, clientSeed, roundId, pools) {
-    const totalBets = pools.green + pools.purple + pools.blue;
-    if (totalBets === 0) return provablyFairRandom(serverSeed, clientSeed, roundId);
-
-    const payouts = {
-        green: pools.green * multipliers.green,
-        purple: pools.purple * multipliers.purple,
-        blue: pools.blue * multipliers.blue
+    const liabilities = {
+        green: greenKobo * multipliers.green,
+        purple: purpleKobo * multipliers.purple,
+        blue: blueKobo * multipliers.blue
     };
 
-    if (Math.random() < 0.2) return provablyFairRandom(serverSeed, clientSeed, roundId);
-    return Object.keys(payouts).reduce((a, b) => payouts[a] < payouts[b] ? a : b);
-}
+    const exposure = {
+        green: liabilities.green - totalPool,
+        purple: liabilities.purple - totalPool,
+        blue: liabilities.blue - totalPool
+    };
 
-// =======================
-// DB & INITIALIZATION
-// =======================
-if (MONGO_URI) {
-    mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000, family: 4 })
-    .then(() => {
-        console.log("✅ MongoDB Connected Successfully");
-        initializeGame();
-    })
-    .catch(err => console.error("❌ MongoDB Connection Error:", err.message));
-}
-
-async function initializeGame() {
-    try {
-        const saved = await GlobalState.findOne({ key: "current" });
-        if (saved) game.pools = saved.pools;
-    } catch (e) {}
-
-    game.serverSeed = generateServerSeed();
-    game.serverSeedHash = hashSeed(game.serverSeed);
-    startGameLoop();
+    return { pools, liabilities, exposure, totalPoolKobo: totalPool };
 }
 
 async function finalizeRound() {
-    const winner = game.winner;
     const roundId = game.roundId;
-    const winningBets = await Bet.find({ roundId, color: winner });
+    const winner = game.winner;
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            if (await Round.findOne({ roundId }).session(session)) return;
+            const pools = await getRedisPools(roundId);
 
-    for (const bet of winningBets) {
-        const payout = bet.amount * multipliers[winner];
-        const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payout } }, { new: true });
-        if (user) {
-            await Transaction.create({
-                userId: bet.userId, type: 'win', amount: payout, balanceAfter: user.balance,
-                description: `Win on ${winner} (${roundId})`, status: 'success',
-                serverSeed: game.serverSeed, clientSeed: game.clientSeed, winningColor: winner, userColor: bet.color,
-                createdAt: new Date()
-            });
-            io.to(bet.userId).emit("balance_update", { balance: user.balance });
+            let totalBetsKobo = Math.floor((pools.green + pools.purple + pools.blue) * 100);
+            let totalPayoutKobo = 0;
+
+            const colorStats = {
+                green: { players: 0, amount: 0 },
+                purple: { players: 0, amount: 0 },
+                blue: { players: 0, amount: 0 }
+            };
+            const winningPlayers = [];
+            const losingPlayers = [];
+            // Settlement events are emitted only after the Mongo transaction
+            // commits, so the client never sees WON/LOST before the database
+            // has actually stored the result.
+            const settledEvents = [];
+
+            const bets = await Bet.find({ roundId, settled: false }).session(session);
+            for (const bet of bets) {
+                const color = bet.color.toLowerCase();
+                colorStats[color].players += 1;
+                colorStats[color].amount += bet.amount;
+
+                const isWinner = color === winner.toLowerCase();
+                const payoutKobo = isWinner ? bet.amount * multipliers[winner] : 0;
+                totalPayoutKobo += payoutKobo;
+
+                await Bet.updateOne({ _id: bet._id }, { $set: { settled: true, result: isWinner ? "WON" : "LOST", payout: payoutKobo } }).session(session);
+
+                // Update Bonus Progress for every settled bet (Win or Loss)
+                await updateBonusProgress(io, bet.userId, bet.amount);
+
+                if (isWinner) {
+                    const user = await User.findOneAndUpdate({ userId: bet.userId }, { $inc: { balance: payoutKobo, "stats.totalWins": 1 } }, { session, new: true });
+                    await Transaction.create([{
+                        userId: bet.userId,
+                        username: bet.username || "User",
+                        type: 'win',
+                        amount: bet.amount,
+                        payout: payoutKobo,
+                        status: 'success',
+                        roundId,
+                        winningColor: winner,
+                        userColor: bet.color,
+                        balanceAfter: user.balance
+                    }], { session });
+                    winningPlayers.push({ username: bet.username, userId: bet.userId, betAmount: bet.amount, winningAmount: payoutKobo });
+
+                    // Notify WIN
+                    createNotification(io, {
+                        uid: bet.userId,
+                        title: 'You Won! 🏆',
+                        body: `Congratulations! Your bet on ${bet.color} won ₦${(payoutKobo / 100).toLocaleString()}.`,
+                        type: 'bet',
+                        priority: 'high',
+                        route: '/bet_history',
+                        payload: { roundId },
+                        category: 'game',
+                        icon: 'celebration',
+                        idempotencyKey: `win_${roundId}_${bet._id}`
+                    });
+                } else {
+                    losingPlayers.push({ username: bet.username, userId: bet.userId, color: bet.color, betAmount: bet.amount });
+
+                    // Notify LOSS
+                    createNotification(io, {
+                        uid: bet.userId,
+                        title: 'Bet Result',
+                        body: `Your bet on ${bet.color} lost. The winning color was ${winner}.`,
+                        type: 'bet',
+                        priority: 'normal',
+                        route: '/bet_history',
+                        payload: { roundId },
+                        category: 'game',
+                        icon: 'info',
+                        idempotencyKey: `loss_${roundId}_${bet._id}`
+                    });
+                }
+                if (bet.transactionId) {
+                    await Transaction.updateOne({ _id: bet.transactionId }, { $set: { status: 'success', winningColor: winner, payout: payoutKobo } }).session(session);
+                }
+
+                // Queue the authoritative result for emission after the
+                // transaction commits. The mapped amount/payout are in Naira.
+                const settledBet = {
+                    ...bet.toObject(),
+                    settled: true,
+                    result: isWinner ? "WON" : "LOST",
+                    payout: payoutKobo
+                };
+                settledEvents.push({
+                    bet: mapBet(settledBet),
+                    userId: bet.userId,
+                    balance: isWinner ? (await User.findOne({ userId: bet.userId }).session(session)).balance / 100 : null,
+                    payout: payoutKobo / 100,
+                    color: bet.color,
+                    result: isWinner ? "WON" : "LOST"
+                });
+
+                // Phase 2: Referral Gameplay Tracking
+                const referral = await ReferralHistory.findOne({ referredUserId: bet.userId, status: 'FIRST_DEPOSIT_COMPLETED' }).session(session);
+                if (referral) {
+                    referral.wagerVolume += bet.amount;
+                    const gameplayConfig = await Config.findOne({ key: 'min_gameplay_requirement' }).session(session);
+                    const requiredGameplay = gameplayConfig ? gameplayConfig.value : 500000;
+
+                    if (referral.wagerVolume >= requiredGameplay) {
+                        referral.status = 'QUALIFIED';
+                        referral.qualified = true;
+                        referral.rewardPending = true;
+
+                        // Notify Referrer
+                        createNotification(io, {
+                            uid: referral.referrerId,
+                            title: 'Referral Qualified 👥',
+                            body: 'Your referred user has completed all qualification requirements. Your referral reward is now pending release.',
+                            type: 'referral',
+                            priority: 'high',
+                            category: 'social',
+                            icon: 'verified',
+                            idempotencyKey: `ref_qualified_${bet.userId}`
+                        });
+
+                        // Update User Referral Status
+                        await User.findOneAndUpdate(
+                            { userId: referral.referrerId },
+                            { $inc: { qualifiedReferrals: 1, pendingReferrals: -1 } }
+                        ).session(session);
+
+                        await referral.save({ session });
+
+                        // Phase 3: Trigger Reward Processing
+                        await processReferralReward(io, bet.userId, session);
+                    } else {
+                        await referral.save({ session });
+                    }
+                }
+            }
+
+            const houseProfitKobo = totalBetsKobo - totalPayoutKobo;
+            const houseEdge = totalBetsKobo > 0 ? ((totalBetsKobo - totalPayoutKobo) / totalBetsKobo) * 100 : 0;
+            game.timeline.completedAt = new Date();
+
+            await Round.create([{
+                ...game,
+                winningColor: winner,
+                totalPool: totalBetsKobo,
+                greenPool: Math.floor(pools.green * 100),
+                purplePool: Math.floor(pools.purple * 100),
+                bluePool: Math.floor(pools.blue * 100),
+                totalBets: totalBetsKobo,
+                totalPayout: totalPayoutKobo,
+                houseProfit: houseProfitKobo,
+                houseEdge: houseEdge,
+                isForced: game.isForced || false,
+                playerCount: bets.length,
+                colorStats,
+                winningPlayers,
+                losingPlayers,
+                timeline: game.timeline,
+                riskSnapshot: game.riskSnapshot,
+                timestamp: new Date()
+            }], { session });
+        });
+        // The database transaction is committed at this point. Now deliver
+        // the settlement to clients in a deterministic order.
+        for (const event of settledEvents) {
+            io.emit("bet_settled", event.bet);
+
+            if (event.result === "WON" && event.balance != null) {
+                io.to(event.userId).emit("balance_update", {
+                    balance: event.balance,
+                    roundId,
+                    color: event.color,
+                    payout: event.payout,
+                    result: event.result
+                });
+            }
         }
-    }
 
-    await Transaction.updateMany(
-        { roundId: roundId, type: 'bet' },
-        { $set: { serverSeed: game.serverSeed, winningColor: winner } }
-    );
+        io.emit("transaction_update");
+        adminIo.emit("stats_update");
+        adminIo.emit("transaction_update");
+        adminIo.emit("round_history_update");
+    } catch (e) { console.error("❌ Finalize Error:", e.message); } finally { session.endSession(); }
 }
 
-// =======================
-// GAME LOOP
-// =======================
-let gameLoopStarted = false;
 function startGameLoop() {
-    if (gameLoopStarted) return;
-    gameLoopStarted = true;
-    console.log("🚀 Game Engine Started");
-
     setInterval(async () => {
-        game.time--;
-
-        if (game.time === ROUND_TIME - 1) {
-            io.emit("round_hash", { hash: game.serverSeedHash });
+        if (!isMaster) return;
+        if (!game.serverSeed) {
+            game.serverSeed = crypto.randomBytes(32).toString('hex');
+            game.serverSeedHash = crypto.createHash('sha256').update(game.serverSeed).digest('hex');
         }
-
-        if (game.time === LOCK_AT && game.status === "betting") {
+        game.time--;
+        if (game.time === ROUND_TIME - 1) io.emit("round_hash", { hash: game.serverSeedHash });
+        if (game.time === LOCK_AT) {
             game.bettingLocked = true;
             game.status = "locked";
-            secretCalculatedWinner = determineWinner(game.serverSeed, game.clientSeed, game.roundId, game.pools);
-        }
+            game.timeline.lockedAt = new Date();
 
-        if (game.time === RESULT_AT && game.status === "locked") {
+            const analytics = await getAdminAnalytics();
+            game.riskSnapshot = {
+                green: analytics.exposure.green,
+                purple: analytics.exposure.purple,
+                blue: analytics.exposure.blue
+            };
+
+            if (game.forcedWinner) {
+                game.winner = game.forcedWinner;
+                game.isForced = true;
+                // game.forcedAt, forcedBy, forcedReason already set at trigger
+                game.forcedWinner = null;
+            } else {
+                const combined = `${game.serverSeed}:${game.clientSeed}:${game.roundId}`;
+                const hash = crypto.createHash('sha256').update(combined).digest('hex');
+                const num = parseInt(hash.substring(0, 8), 16) / 0xffffffff;
+                game.winner = num < 0.485 ? "green" : (num < 0.808 ? "purple" : "blue");
+                game.isForced = false;
+                game.forcedBy = null;
+            }
+        }
+        if (game.time === RESULT_AT) {
             game.status = "result";
-            game.winner = secretCalculatedWinner;
+            game.timeline.resultAt = new Date();
             io.emit("round_result", { winner: game.winner });
-            io.emit("server_seed_reveal", {
-                serverSeed: game.serverSeed,
-                clientSeed: game.clientSeed,
-                roundId: game.roundId
-            });
-            await finalizeRound();
+            finalizeRound();
         }
-
         if (game.time <= 0) {
-            const nextSeed = generateServerSeed();
             game = {
                 roundId: `R-${Date.now()}`,
-                time: ROUND_TIME,
-                status: "betting",
-                bettingLocked: false,
-                winner: null,
-                serverSeed: nextSeed,
-                serverSeedHash: hashSeed(nextSeed),
+                time: ROUND_TIME, status: "betting", bettingLocked: false,
+                winner: null, serverSeed: null, serverSeedHash: null,
                 clientSeed: `CLIENT_${Date.now()}`,
-                pools: { green: 0, purple: 0, blue: 0 }
+                forcedWinner: null, forcedBy: null, forcedAt: null, forcedReason: null, isForced: false,
+                timeline: { startedAt: new Date(), lockedAt: null, resultAt: null, completedAt: null },
+                riskSnapshot: null
             };
-            secretCalculatedWinner = null;
-        }
 
-        io.emit("game_update", { ...game, serverSeed: undefined });
-        if (mongoose.connection.readyState === 1) {
-            GlobalState.updateOne({ key: "current" }, { ...game }, { upsert: true }).catch(() => {});
+            // Explicit boundary event: the client clears the previous round's
+            // pool immediately, then subsequent new_bet events build this
+            // fresh round's live pool.
+            io.emit("round_started", {
+                roundId: game.roundId,
+                time: game.time,
+                status: game.status,
+                bettingLocked: false,
+                pools: { green: 0, purple: 0, blue: 0 },
+                playersOnline: io.sockets.sockets.size
+            });
         }
+        await pubClient.publish('game_state_updates', JSON.stringify(game));
+        const response = await getGameResponse();
+        io.emit("game_update", response);
+
+        const analytics = await getAdminAnalytics();
+        adminIo.emit("admin_game_update", { ...response, ...analytics, forcedWinner: game.forcedWinner });
     }, 1000);
 }
 
 // =======================
-// AUTH MIDDLEWARE
+// UTILS & MAPPING
 // =======================
-async function verifyToken(req, res, next) {
+
+const mapBet = b => {
+    const o = b.toObject ? b.toObject() : b;
+    return { ...o, id: o._id, amount: o.amount / 100, payout: o.payout / 100 };
+};
+
+const mapTx = t => {
+    const o = t.toObject ? t.toObject() : t;
+    let amount = Math.abs(o.amount || 0) / 100;
+    let payout = (o.payout || 0) / 100;
+    if (o.type === 'win' && (payout === 0 || !o.payout) && amount > 0) {
+        const color = (o.userColor || o.winningColor || 'green').toLowerCase();
+        const mult = multipliers[color] || 2;
+        payout = amount * mult;
+    }
+    let username = o.username || "User";
+    if (username.includes('@')) username = username.split('@')[0];
+    return {
+        ...o,
+        id: o._id,
+        amount: amount,
+        payout: payout,
+        profit: Math.max(0, payout - amount),
+        color: o.userColor || o.winningColor || 'green',
+        balanceAfter: (o.balanceAfter || 0) / 100,
+        username: username
+    };
+};
+
+// =======================
+// ROUTES
+// =======================
+
+app.use('/support', require('./routes/support'));
+app.use('/referral', require('./routes/referrals'));
+app.use('/bonuses', require('./routes/bonuses'));
+app.use('/campaigns', require('./routes/campaigns'));
+
+app.get('/game-state', verifyToken, async (req, res) => {
     try {
-        if (!firebaseConfigured) {
-            console.warn("verifyToken: Firebase service account not configured");
-            return res.status(503).json({ success: false, error: 'Auth unavailable' });
-        }
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ success: false, error: 'No token provided' });
-        }
-        const token = authHeader.split('Bearer ')[1];
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        req.user = decodedToken;
-        next();
-    } catch (error) {
-        console.error("Auth Error:", error.message);
-        return res.status(401).json({ success: false, error: 'Invalid or expired token' });
-    }
-}
+        let user = await User.findOne({ userId: req.user.uid });
+        const isNewUser = !user;
 
-// =======================
-// API ROUTES
-// =======================
-app.get('/health', (req, res) => res.json({ success: true, status: "healthy" }));
+        if (isNewUser) {
+            const referralCode = await generateReferralCode();
+            let referredBy = null;
 
-app.get('/game-state', async (req, res) => {
-    const userId = req.query.userId || "user1";
-    try {
-        let user = await User.findOne({ userId });
-        return res.json({ ...game, serverSeed: undefined, balance: user?.balance || 0 });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: "Database error" });
-    }
-});
+            // Handle referral from query or body if provided during initialization
+            const refCode = req.query.ref || req.body.ref;
+            if (refCode) {
+                const referrer = await User.findOne({ referralCode: refCode.toUpperCase() });
+                if (referrer && referrer.userId !== req.user.uid) {
+                    referredBy = referrer.userId;
 
-app.post('/bet', verifyToken, async (req, res) => {
-    const { color, amount } = req.body;
-    if (game.status !== "betting" || game.bettingLocked) return res.status(400).json({ success: false, error: "Round is locked" });
-    try {
-        const user = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: amount } }, { $inc: { balance: -amount } }, { new: true });
-        if (!user) return res.status(400).json({ success: false, error: "Insufficient balance" });
+                    // Update Referrer
+                    await User.findOneAndUpdate(
+                        { userId: referrer.userId },
+                        { $inc: { totalReferrals: 1, pendingReferrals: 1 } }
+                    );
 
-        await Bet.create({ userId: req.user.uid, roundId: game.roundId, color: color.toLowerCase(), amount, time: new Date() });
-        game.pools[color.toLowerCase()] += amount;
+                    // Create Referral History
+                    await ReferralHistory.create({
+                        referrerId: referrer.userId,
+                        referredUserId: req.user.uid,
+                        referredUsername: req.user.email?.split('@')[0] || 'User',
+                        status: 'REGISTERED'
+                    });
 
-        await Transaction.create({
-            userId: req.user.uid, type: 'bet', amount: -amount, balanceAfter: user.balance,
-            description: `Bet on ${color}`, status: 'success',
-            roundId: game.roundId, serverSeedHash: game.serverSeedHash, clientSeed: game.clientSeed, userColor: color.toLowerCase(),
-            createdAt: new Date()
-        });
-
-        io.emit("pool_update", game.pools);
-        io.emit("new_bet", {
-            username: user.email.split('@')[0], amount, color: color.toLowerCase(), time: new Date()
-        });
-
-        return res.json({ success: true, balance: user.balance });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// =======================
-// PAYSTACK ROUTES
-// =======================
-
-app.post('/initialize-payment', verifyToken, async (req, res) => {
-    console.log("Initialize payment route hit");
-    const { email, amount } = req.body;
-
-    if (!email || !amount) {
-        return res.status(400).json({ success: false, error: "Email and amount are required in body" });
-    }
-
-    if (!PAYSTACK_SECRET_KEY) {
-        console.error("PAYSTACK_SECRET_KEY is missing in process.env");
-        return res.status(500).json({ success: false, error: "Server misconfiguration: Payment key missing" });
-    }
-
-    try {
-        const response = await axios.post('https://api.paystack.co/transaction/initialize', {
-            email: email,
-            amount: Math.round(amount * 100), // Paystack uses kobo
-        }, {
-            headers: {
-                Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-                'Content-Type': 'application/json',
+                    // Notify Referrer
+                    createNotification(io, {
+                        uid: referrer.userId,
+                        title: 'New Referral Joined 👥',
+                        body: 'A new user has registered using your referral code. They need to complete the qualification requirements before your referral reward becomes available.',
+                        type: 'referral',
+                        priority: 'normal',
+                        category: 'social',
+                        icon: 'person_add',
+                        idempotencyKey: `ref_join_${req.user.uid}`
+                    });
+                }
             }
-        });
 
-        if (response.data && response.data.status) {
-            console.log(`Payment initialized for ${email}: ${response.data.data.reference}`);
-            return res.json({
-                success: true,
-                authorization_url: response.data.data.authorization_url,
-                reference: response.data.data.reference
+            user = new User({
+                userId: req.user.uid,
+                email: req.user.email || "user@example.com",
+                referralCode,
+                referredBy,
+                balance: 0,
+                stats: { totalBets: 0, totalWins: 0 }
             });
+            await user.save();
+
+            // Phase 5: Award Welcome Bonus for new users
+            await awardBonus(io, req.user.uid, 'WELCOME_BONUS');
         } else {
-            return res.status(400).json({ success: false, error: "Paystack initialization failed" });
+            user.lastLogin = new Date();
+            await user.save();
         }
-    } catch (error) {
-        console.error("Paystack Init Error:", error.response?.data || error.message);
-        return res.status(500).json({
-            success: false,
-            error: error.response?.data?.message || error.message || "External payment service error"
-        });
+
+        const history = await Round.find().sort({ createdAt: -1 }).limit(20);
+        const response = await getGameResponse();
+        res.json({ success: true, data: { ...response, balance: user.balance / 100, colorHistory: history.map(r => r.winner), playStreak: user.playStreak, canClaimBonus: !user.lastBonusClaimTime || (new Date() - user.lastBonusClaimTime > 86400000) } });
+    } catch (e) {
+        console.error("Game-state error:", e);
+        res.status(500).json({ success: false });
     }
 });
 
-app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
-    console.log(`Verify payment route hit for ref: ${req.params.reference}`);
-    const { reference } = req.params;
+app.post('/bet', verifyToken, validate(schemas.bet), async (req, res) => {
+    const { color, amount, idempotencyKey } = req.body;
+    const kobo = Math.floor(amount * 100);
+    if (game.status !== "betting" || game.bettingLocked) return res.status(400).json({ success: false, error: "Locked" });
 
-    if (!PAYSTACK_SECRET_KEY) {
-        return res.status(500).json({ success: false, error: "Server configuration error" });
+    // Pre-check idempotency before starting transaction
+    if (idempotencyKey) {
+        const existingTx = await Transaction.findOne({ userId: req.user.uid, idempotencyKey });
+        if (existingTx) {
+            const user = await User.findOne({ userId: req.user.uid });
+            return res.json({ success: true, data: { balance: (user?.balance || 0) / 100 }, replayed: true });
+        }
     }
 
+    const session = await mongoose.startSession();
     try {
-        const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
-            headers: {
-                Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-            }
-        });
-
-        if (response.data && response.data.status && response.data.data.status === 'success') {
-            const amount = response.data.data.amount / 100;
-            const userId = req.user.uid;
-
-            // Prevent double crediting by checking unique reference
-            const existingTx = await Transaction.findOne({ reference, status: 'success' });
-            if (existingTx) {
-                const user = await User.findOne({ userId });
-                return res.json({ success: true, balance: user.balance, message: "Already credited" });
+        let bal = 0; let betObj = null;
+        await session.withTransaction(async () => {
+            // Secondary check within transaction scope for concurrent requests
+            if (idempotencyKey) {
+                const existingInTx = await Transaction.findOne({ userId: req.user.uid, idempotencyKey }).session(session);
+                if (existingInTx) {
+                    const u = await User.findOne({ userId: req.user.uid }).session(session);
+                    bal = u.balance;
+                    return;
+                }
             }
 
             const user = await User.findOneAndUpdate(
-                { userId },
-                { $inc: { balance: amount } },
-                { new: true, upsert: true }
+                { userId: req.user.uid, balance: { $gte: kobo } },
+                { $inc: { balance: -kobo, "stats.totalBets": 1 } },
+                { session, new: true }
             );
-
-            await Transaction.create({
-                userId,
-                type: 'deposit',
-                amount,
+            if (!user) throw new Error("Insufficient funds");
+            bal = user.balance;
+            const username = req.user.email?.split('@')[0] || "User";
+            const tx = await Transaction.create([{
+                userId: req.user.uid,
+                username,
+                type: 'bet',
+                amount: -kobo,
                 balanceAfter: user.balance,
-                description: 'Paystack Deposit',
-                status: 'success',
-                reference,
-                createdAt: new Date()
-            });
+                status: 'pending',
+                roundId: game.roundId,
+                userColor: color,
+                idempotencyKey: idempotencyKey || null
+            }], { session });
+            const b = await Bet.create([{
+                userId: req.user.uid,
+                username,
+                roundId: game.roundId,
+                color,
+                amount: kobo,
+                transactionId: tx[0]._id
+            }], { session });
+            betObj = b[0];
+            await pubClient.hIncrBy(`pools:${game.roundId}`, color, kobo);
 
-            io.to(userId).emit("balance_update", { balance: user.balance });
-            console.log(`Deposit successful: ${amount} NGN credited to ${userId}`);
-            return res.json({ success: true, balance: user.balance });
-        } else {
-            return res.status(400).json({ success: false, error: "Payment verification failed: Not successful" });
-        }
-    } catch (error) {
-        console.error("Paystack Verify Error:", error.response?.data || error.message);
-        return res.status(500).json({
-            success: false,
-            error: error.response?.data?.message || error.message || "Payment verification service error"
+            // Notify Bet Placed
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Bet Placed',
+                body: `Your bet of ₦${amount.toLocaleString()} on ${color} has been placed.`,
+                type: 'bet',
+                route: '/bet_history',
+                metadata: { roundId: game.roundId, color, amount },
+                category: 'game',
+                idempotencyKey: idempotencyKey ? `notif_${idempotencyKey}` : `bet_${game.roundId}_${betObj._id}`
+            });
         });
+        if (betObj) {
+            const mapped = mapBet(betObj);
+            io.emit("new_bet", mapped);
+            adminIo.emit("new_bet", mapped);
+            adminIo.emit("stats_update");
+        }
+        res.json({ success: true, data: { balance: bal / 100 } });
+    } catch (e) {
+        if (e.code === 11000 && idempotencyKey) {
+            const user = await User.findOne({ userId: req.user.uid });
+            return res.json({ success: true, data: { balance: (user?.balance || 0) / 100 }, replayed: true });
+        }
+        res.status(400).json({ success: false, error: e.message });
+    } finally { session.endSession(); }
+});
+
+app.post('/initialize-payment', verifyToken, validate(schemas.deposit), async (req, res) => {
+    try {
+        const amount = req.body.amount;
+        const r = await paystackAxios.post('/transaction/initialize', { email: req.body.email, amount: Math.floor(amount * 100), metadata: { userId: req.user.uid } }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } });
+
+        const reference = r.data.data.reference;
+
+        // Notify Deposit Initiated
+        createNotification(io, {
+            uid: req.user.uid,
+            title: 'Deposit Initiated 💳',
+            body: `You have initiated a deposit of ₦${amount.toLocaleString()}. Please complete the payment.`,
+            type: 'deposit',
+            route: '/wallet',
+            category: 'finance',
+            icon: 'payments',
+            idempotencyKey: `dep_init_${reference}`
+        });
+
+        res.json({ success: true, data: r.data.data });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/verify-payment/:reference', verifyToken, async (req, res) => {
+    try {
+        const reference = req.params.reference;
+        const r = await paystackAxios.get(`/transaction/verify/${reference}`, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } });
+
+        if (r.data.data.status === 'success') {
+            const amount = r.data.data.amount;
+            const userId = r.data.data.metadata.userId;
+            const session = await mongoose.startSession();
+            let bal = 0;
+            try {
+                await session.withTransaction(async () => {
+                    const ex = await Transaction.findOne({ reference }).session(session);
+                    if (ex) {
+                        const u = await User.findOne({ userId }).session(session);
+                        bal = u.balance;
+                        return;
+                    }
+
+                    // Phase 2: Referral First Deposit Check
+                    const user = await User.findOne({ userId }).session(session);
+                    if (user && user.totalDeposited === 0) {
+                        // Phase 5: Award First Deposit Bonus
+                        await awardBonus(io, userId, 'FIRST_DEPOSIT_BONUS', session);
+
+                        const depositConfig = await Config.findOne({ key: 'min_referral_deposit' }).session(session);
+                        const minDeposit = depositConfig ? depositConfig.value : 500000;
+
+                        if (amount >= minDeposit) {
+                            const referral = await ReferralHistory.findOne({ referredUserId: userId, status: 'REGISTERED' }).session(session);
+                            if (referral) {
+                                referral.status = 'FIRST_DEPOSIT_COMPLETED';
+                                await referral.save({ session });
+
+                                // Phase 3: Check for qualification if gameplay requirement is met/0
+                                const gameplayConfig = await Config.findOne({ key: 'min_gameplay_requirement' }).session(session);
+                                const requiredGameplay = gameplayConfig ? gameplayConfig.value : 500000;
+
+                                if (referral.wagerVolume >= requiredGameplay) {
+                                    referral.status = 'QUALIFIED';
+                                    referral.qualified = true;
+                                    referral.rewardPending = true;
+                                    await referral.save({ session });
+
+                                    await User.findOneAndUpdate(
+                                        { userId: referral.referrerId },
+                                        { $inc: { qualifiedReferrals: 1, pendingReferrals: -1 } }
+                                    ).session(session);
+
+                                    await processReferralReward(io, userId, session);
+                                }
+                            }
+                        }
+                    }
+
+                    const u = await User.findOneAndUpdate({ userId }, { $inc: { balance: amount, totalDeposited: amount } }, { session, new: true });
+                    bal = u.balance;
+                    await Transaction.create([{ userId, type: 'deposit', amount, balanceAfter: u.balance, status: 'success', reference }], { session });
+
+                    // Notify Deposit Successful
+                    createNotification(io, {
+                        uid: userId,
+                        title: 'Deposit Successful ✅',
+                        body: `₦${(amount / 100).toLocaleString()} has been credited to your wallet.`,
+                        type: 'deposit',
+                        priority: 'high',
+                        route: '/transaction_history',
+                        payload: { highlight: reference },
+                        category: 'finance',
+                        icon: 'check_circle',
+                        idempotencyKey: `dep_success_${reference}`
+                    });
+                });
+                adminIo.emit("stats_update");
+                res.json({ success: true, data: { balance: bal / 100 } });
+            } finally { session.endSession(); }
+        } else if (['failed', 'cancelled', 'abandoned', 'expired'].includes(r.data.data.status)) {
+            // ONLY notify if Paystack explicitly says it failed/etc
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Deposit Failed ❌',
+                body: `Your deposit attempt with reference ${reference} was ${r.data.data.status}.`,
+                type: 'deposit',
+                priority: 'normal',
+                route: '/deposit',
+                category: 'finance',
+                icon: 'error_outline',
+                idempotencyKey: `dep_failed_${reference}`
+            });
+            res.status(400).json({ success: false, error: "Payment failed" });
+        } else {
+            // Still pending or initialized, don't notify failed yet
+            res.json({ success: false, status: r.data.data.status });
+        }
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/my-bets', verifyToken, async (req, res) => {
+    const bets = await Bet.find({ userId: req.user.uid }).sort({ time: -1 }).limit(50);
+    res.json({ success: true, data: bets.map(mapBet) });
+});
+
+app.get('/all-bets', verifyToken, async (req, res) => {
+    const bets = await Bet.find({ roundId: game.roundId }).sort({ time: -1 }).limit(50);
+    res.json({ success: true, data: bets.map(mapBet) });
+});
+
+app.get('/top-wins', verifyToken, async (req, res) => {
+    try {
+        const wins = await Transaction.aggregate([
+            { $match: { type: 'win', status: 'success' } },
+            { $addFields: { sortPayout: { $ifNull: ["$payout", "$amount"] } }},
+            { $sort: { sortPayout: -1 } },
+            { $limit: 20 },
+            {
+                $lookup: {
+                    from: 'bets',
+                    let: { uId: "$userId", rId: "$roundId" },
+                    pipeline: [
+                        { $match: { $expr: { $and: [ { $eq: ["$userId", "$$uId"] }, { $eq: ["$roundId", "$$rId"] } ] } } },
+                        { $project: { username: 1 } },
+                        { $limit: 1 }
+                    ],
+                    as: 'betInfo'
+                }
+            },
+            { $unwind: { path: "$betInfo", preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'users',
+                    localField: 'userId',
+                    foreignField: 'userId',
+                    as: 'userInfo'
+                }
+            },
+            { $unwind: { path: "$userInfo", preserveNullAndEmptyArrays: true } },
+            { $addFields: {
+                username: {
+                    $ifNull: [
+                        "$username",
+                        "$betInfo.username",
+                        { $arrayElemAt: [{ $split: ["$userInfo.email", "@"] }, 0] },
+                        "User"
+                    ]
+                }
+            }},
+            { $project: { betInfo: 0, userInfo: 0, sortPayout: 0 } }
+        ]);
+        res.json({ success: true, data: wins.map(mapTx) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/transactions', verifyToken, async (req, res) => {
+    const { type } = req.query;
+    let q = { userId: req.user.uid };
+    if (type === 'game') q.type = { $in: ['bet', 'win'] };
+    else if (type === 'finance') q.type = { $in: ['deposit', 'withdrawal', 'bonus'] };
+    const txs = await Transaction.find(q).sort({ createdAt: -1 }).limit(50);
+    res.json({ success: true, data: txs.map(mapTx) });
+});
+
+app.get('/round/:roundId', verifyToken, async (req, res) => {
+    const r = await Round.findOne({ roundId: req.params.roundId });
+    res.json({ success: true, data: r });
+});
+
+app.post('/claim-bonus', verifyToken, async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+        let bal = 0;
+        await session.withTransaction(async () => {
+            const u = await User.findOneAndUpdate({ userId: req.user.uid, $or: [{ lastBonusClaimTime: { $lt: new Date(Date.now() - 86400000) } }, { lastBonusClaimTime: null }] }, { $inc: { balance: 10000 }, $set: { lastBonusClaimTime: new Date() } }, { session, new: true });
+            if (!u) throw new Error("Already claimed");
+            bal = u.balance;
+            const tx = await Transaction.create([{ userId: req.user.uid, type: 'bonus', amount: 10000, balanceAfter: u.balance }], { session });
+
+            // Notify Bonus Claimed
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Daily Bonus! 🌟',
+                body: '₦100 has been added to your wallet as a daily bonus.',
+                type: 'bonus',
+                priority: 'normal',
+                route: '/wallet',
+                category: 'promo',
+                icon: 'redeem',
+                idempotencyKey: `bonus_${req.user.uid}_${new Date().toISOString().split('T')[0]}`
+            });
+        });
+        adminIo.emit("stats_update");
+        res.json({ success: true, data: { balance: bal / 100 } });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+app.post('/withdraw', verifyToken, validate(schemas.withdraw), async (req, res) => {
+    const kobo = Math.floor(req.body.amount * 100);
+    const session = await mongoose.startSession();
+    try {
+        // Phase 8: Withdrawal Eligibility Check
+        const eligibility = await checkWithdrawalEligibility(req.user.uid);
+        if (!eligibility.eligible) {
+            return res.status(403).json({
+                success: false,
+                error: eligibility.reason,
+                status: eligibility.status,
+                details: eligibility.details
+            });
+        }
+
+        let tx = null;
+        await session.withTransaction(async () => {
+            const u = await User.findOneAndUpdate({ userId: req.user.uid, balance: { $gte: kobo } }, { $inc: { balance: -kobo } }, { session, new: true });
+            if (!u) throw new Error("Insufficient funds");
+            const resTx = await Transaction.create([{ userId: req.user.uid, type: 'withdrawal', amount: -kobo, balanceAfter: u.balance, status: 'pending', bankDetails: req.body.bankDetails }], { session });
+            tx = resTx[0];
+
+            // Notify Withdrawal Submitted
+            createNotification(io, {
+                uid: req.user.uid,
+                title: 'Withdrawal Submitted ⏳',
+                body: `Your withdrawal request for ₦${req.body.amount.toLocaleString()} has been received and is pending review.`,
+                type: 'withdrawal',
+                priority: 'normal',
+                route: '/withdrawal_history',
+                category: 'finance',
+                icon: 'pending_actions',
+                idempotencyKey: `with_submit_${tx._id}`
+            });
+        });
+        adminIo.emit("new_withdrawal", mapTx(tx));
+        adminIo.emit("stats_update");
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+// =======================
+// ADMIN ROUTES
+// =======================
+
+app.get('/admin/verify', verifyAdmin, (req, res) => res.json({ success: true }));
+
+app.get('/admin/stats', verifyAdmin, async (req, res) => {
+    try {
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+        const totalUsers = await User.countDocuments();
+        const newUsersToday = await User.countDocuments({ createdAt: { $gte: startOfToday } });
+        const onlineUsers = io.sockets.sockets.size;
+
+        const userStats = await User.aggregate([{ $group: { _id: null, totalLiability: { $sum: "$balance" } } }]);
+        const currentWalletLiability = (userStats[0]?.totalLiability || 0) / 100;
+
+        const financialStats = await Transaction.aggregate([
+            { $match: { status: 'success' } },
+            { $group: {
+                _id: null,
+                totalDeposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
+                totalWithdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } },
+                todayDeposits: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "deposit"] }, { $gte: ["$createdAt", startOfToday] }] }, "$amount", 0] } },
+                todayWithdrawals: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "withdrawal"] }, { $gte: ["$createdAt", startOfToday] }] }, { $abs: "$amount" }, 0] } }
+            } }
+        ]);
+
+        const pendingWithdrawalLiabilityAgg = await Transaction.aggregate([
+            { $match: { type: 'withdrawal', status: 'pending' } },
+            { $group: { _id: null, total: { $sum: { $abs: "$amount" } } } }
+        ]);
+        const pendingWithdrawalLiability = (pendingWithdrawalLiabilityAgg[0]?.total || 0) / 100;
+
+        const gameStats = await Round.aggregate([
+            { $group: {
+                _id: null,
+                totalBets: { $sum: "$totalPool" },
+                totalPayout: { $sum: "$totalPayout" },
+                totalProfit: { $sum: "$houseProfit" },
+                count: { $sum: 1 }
+            } }
+        ]);
+
+        // Support Statistics - Updated to use status-specific timestamps
+        const openTickets = await SupportTicket.countDocuments({ status: 'Open' });
+        const pendingTickets = await SupportTicket.countDocuments({ status: 'Pending' });
+        const resolvedToday = await SupportTicket.countDocuments({ status: 'Resolved', resolvedAt: { $gte: startOfToday } });
+        const closedToday = await SupportTicket.countDocuments({ status: 'Closed', closedAt: { $gte: startOfToday } });
+
+        const fin = financialStats[0] || { totalDeposits: 0, totalWithdrawals: 0, todayDeposits: 0, todayWithdrawals: 0 };
+        const gme = gameStats[0] || { totalBets: 0, totalPayout: 0, totalProfit: 0, count: 0 };
+
+        const todayDeposits = fin.todayDeposits / 100;
+        const todayWithdrawals = fin.todayWithdrawals / 100;
+        const todayNetCashFlow = todayDeposits - todayWithdrawals;
+
+        res.json({
+            success: true,
+            data: {
+                totalUsers, newUsersToday, onlineUsers,
+                totalDeposits: fin.totalDeposits / 100,
+                totalWithdrawals: fin.totalWithdrawals / 100,
+                todayDeposits,
+                todayWithdrawals,
+                todayNetCashFlow,
+                currentWalletLiability,
+                pendingWithdrawalLiability,
+                totalBets: gme.totalBets / 100,
+                totalPayout: gme.totalPayout / 100,
+                houseProfit: gme.totalProfit / 100,
+                totalRounds: gme.count,
+                // Support counts
+                openTickets,
+                pendingTickets,
+                resolvedToday,
+                closedToday
+            }
+        });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/analytics', verifyAdmin, async (req, res) => {
+    try {
+        const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        const profitTrends = await Round.aggregate([
+            { $match: { createdAt: { $gte: sevenDaysAgo } } },
+            { $group: {
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                profit: { $sum: "$houseProfit" },
+                volume: { $sum: "$totalPool" }
+            } },
+            { $sort: { "_id": 1 } }
+        ]);
+
+        const financeTrends = await Transaction.aggregate([
+            { $match: { status: 'success', createdAt: { $gte: sevenDaysAgo }, type: { $in: ['deposit', 'withdrawal'] } } },
+            { $group: {
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                deposits: { $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] } },
+                withdrawals: { $sum: { $cond: [{ $eq: ["$type", "withdrawal"] }, { $abs: "$amount" }, 0] } }
+            } },
+            { $sort: { "_id": 1 } }
+        ]);
+
+        res.json({
+            success: true,
+            data: {
+                profitTrends: profitTrends.map(t => ({ date: t._id, profit: t.profit / 100, volume: t.volume / 100 })),
+                financeTrends: financeTrends.map(t => ({ date: t._id, deposits: t.deposits / 100, withdrawals: t.withdrawals / 100 }))
+            }
+        });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/round-analytics', verifyAdmin, async (req, res) => {
+    try {
+        const colorDistribution = await Round.aggregate([
+            { $group: {
+                _id: "$winningColor",
+                count: { $sum: 1 },
+                totalProfit: { $sum: "$houseProfit" }
+            } }
+        ]);
+        res.json({ success: true, data: colorDistribution.map(d => ({ color: d._id, count: d.count, profit: d.totalProfit / 100 })) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/force-winner', verifyAdmin, async (req, res) => {
+    const { color, reason } = req.body;
+    if (!['green', 'purple', 'blue'].includes(color)) return res.status(400).json({ success: false, error: "Invalid color" });
+    game.forcedWinner = color;
+    game.forcedBy = req.user.uid;
+    game.forcedReason = reason || "Admin override";
+    game.forcedAt = new Date();
+    res.json({ success: true, message: `Forced winner set to ${color}` });
+});
+
+app.get('/admin/withdrawals', verifyAdmin, async (req, res) => {
+    try {
+        const withdrawals = await Transaction.find({ type: 'withdrawal', status: 'pending' }).sort({ createdAt: -1 });
+        res.json({ success: true, data: withdrawals.map(mapTx) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/withdrawal-action', verifyAdmin, validate(schemas.adminAction), async (req, res) => {
+    const { transactionId, action, notes } = req.body;
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            const tx = await Transaction.findById(transactionId).session(session);
+            if (!tx || tx.type !== 'withdrawal' || tx.status !== 'pending') throw new Error("Invalid transaction");
+
+            if (action === 'approve') {
+                tx.status = 'success';
+                await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { totalWithdrawn: Math.abs(tx.amount) } }, { session });
+
+                // Notify Withdrawal Approved
+                createNotification(io, {
+                    uid: tx.userId,
+                    title: 'Withdrawal Approved ✅',
+                    body: `Your withdrawal for ₦${(Math.abs(tx.amount) / 100).toLocaleString()} has been approved.`,
+                    type: 'withdrawal',
+                    priority: 'high',
+                    route: '/withdrawal_history',
+                    category: 'finance',
+                    icon: 'check_circle',
+                    idempotencyKey: `with_appr_${tx._id}`
+                });
+            } else {
+                tx.status = 'rejected';
+                const u = await User.findOneAndUpdate({ userId: tx.userId }, { $inc: { balance: Math.abs(tx.amount) } }, { session, new: true });
+                await Transaction.create([{ userId: tx.userId, type: 'refund', amount: Math.abs(tx.amount), balanceAfter: u.balance, status: 'success', description: `Refund: Rejected withdrawal` }], { session });
+
+                // Notify Withdrawal Rejected
+                createNotification(io, {
+                    uid: tx.userId,
+                    title: 'Withdrawal Rejected ❌',
+                    body: `Your withdrawal request was rejected. The funds have been returned to your wallet. Reason: ${notes || 'Not specified'}`,
+                    type: 'withdrawal',
+                    priority: 'high',
+                    route: '/withdrawal_history',
+                    category: 'finance',
+                    icon: 'cancel',
+                    idempotencyKey: `with_rej_${tx._id}`
+                });
+            }
+            tx.adminNotes = notes;
+            tx.processedBy = req.user.uid;
+            await tx.save({ session });
+        });
+        adminIo.emit("stats_update");
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+app.get('/admin/users', verifyAdmin, async (req, res) => {
+    try {
+        const { search, page = 1, limit = 50 } = req.query;
+        let query = {};
+        if (search) {
+            query = { $or: [ { userId: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } } ] };
+        }
+        const users = await User.find(query).sort({ lastLogin: -1 }).limit(limit * 1).skip((page - 1) * limit);
+        const count = await User.countDocuments(query);
+        res.json({ success: true, data: { users, totalPages: Math.ceil(count / limit), currentPage: page, totalUsers: count } });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/user/:userId', verifyAdmin, async (req, res) => {
+    try {
+        const user = await User.findOne({ userId: req.params.userId });
+        if (!user) return res.status(404).json({ success: false });
+        const recentBets = await Bet.find({ userId: req.params.userId }).sort({ time: -1 }).limit(10);
+        const recentTransactions = await Transaction.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(10);
+        res.json({ success: true, data: { user, recentBets: recentBets.map(mapBet), recentTransactions: recentTransactions.map(mapTx) } });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/user/toggle-flag', verifyAdmin, async (req, res) => {
+    try {
+        const user = await User.findOne({ userId: req.body.userId });
+        if (!user) return res.status(404).json({ success: false });
+        user.isFlagged = !user.isFlagged;
+        await user.save();
+
+        // Notify Account Status update if flagged
+        if (user.isFlagged) {
+            createNotification(io, {
+                uid: req.body.userId,
+                title: 'Account Restricted ⚠️',
+                body: 'Your account has been flagged for review. Please contact support.',
+                type: 'account',
+                priority: 'high',
+                route: '/profile',
+                category: 'security',
+                icon: 'warning',
+                idempotencyKey: `flag_${req.body.userId}_${Date.now()}`
+            });
+        }
+
+        res.json({ success: true, isFlagged: user.isFlagged });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.post('/admin/user/adjust-balance', verifyAdmin, validate(schemas.adjustBalance), async (req, res) => {
+    const kobo = Math.floor(req.body.amount * 100);
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            const user = await User.findOneAndUpdate({ userId: req.body.userId }, { $inc: { balance: kobo } }, { session, new: true });
+            if (!user) throw new Error("User not found");
+            const tx = await Transaction.create([{ userId: req.body.userId, type: kobo > 0 ? 'bonus' : 'adjustment', amount: kobo, balanceAfter: user.balance, description: `Admin Adjustment: ${req.body.reason}`, processedBy: req.user.uid }], { session });
+            io.to(req.body.userId).emit("balance_update", { balance: user.balance / 100 });
+
+            // Notify Wallet Adjusted
+            createNotification(io, {
+                uid: req.body.userId,
+                title: kobo > 0 ? 'Wallet Credited 💸' : 'Wallet Debited 📉',
+                body: `Your wallet has been ${kobo > 0 ? 'credited' : 'debited'} by ₦${(Math.abs(kobo) / 100).toLocaleString()}. Reason: ${req.body.reason}`,
+                type: 'wallet',
+                priority: 'high',
+                route: '/transaction_history',
+                category: 'finance',
+                icon: kobo > 0 ? 'account_balance_wallet' : 'remove_circle',
+                idempotencyKey: `adj_${tx[0]._id}`
+            });
+        });
+        adminIo.emit("stats_update");
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); } finally { session.endSession(); }
+});
+
+app.get('/admin/transactions', verifyAdmin, async (req, res) => {
+    try {
+        const { type, status, userId, page = 1, limit = 50 } = req.query;
+        let query = {};
+        if (type) query.type = type;
+        if (status) query.status = status;
+        if (userId) query.userId = userId;
+
+        const transactions = await Transaction.find(query).sort({ createdAt: -1 }).limit(limit * 1).skip((page - 1) * limit);
+        res.json({ success: true, data: transactions.map(mapTx) });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/admin/round-history', verifyAdmin, async (req, res) => {
+    try {
+        const {
+            page = 1,
+            limit = 20,
+            roundId,
+            winningColor,
+            isForced,
+            startDate,
+            endDate,
+            sort = 'desc'
+        } = req.query;
+
+        let query = {};
+        if (roundId) query.roundId = { $regex: roundId, $options: 'i' };
+        if (winningColor) query.winningColor = winningColor;
+        if (isForced !== undefined && isForced !== '') query.isForced = isForced === 'true';
+
+        if (startDate || endDate) {
+            query.createdAt = {};
+            if (startDate) query.createdAt.$gte = new Date(startDate);
+            if (endDate) query.createdAt.$lte = new Date(endDate);
+        }
+
+        const history = await Round.find(query)
+            .sort({ createdAt: sort === 'desc' ? -1 : 1 })
+            .limit(limit * 1)
+            .skip((page - 1) * limit);
+
+        const count = await Round.countDocuments(query);
+        res.json({
+            success: true,
+            data: {
+                history: history.map(h => {
+                    const obj = h.toObject();
+                    return {
+                        ...obj,
+                        totalPool: (obj.totalPool || 0) / 100,
+                        greenPool: (obj.greenPool || 0) / 100,
+                        purplePool: (obj.purplePool || 0) / 100,
+                        bluePool: (obj.bluePool || 0) / 100,
+                        totalPayout: (obj.totalPayout || 0) / 100,
+                        houseProfit: (obj.houseProfit || 0) / 100,
+                        riskSnapshot: obj.riskSnapshot ? {
+                            green: (obj.riskSnapshot.green || 0) / 100,
+                            purple: (obj.riskSnapshot.purple || 0) / 100,
+                            blue: (obj.riskSnapshot.blue || 0) / 100
+                        } : null,
+                        winningPlayers: (obj.winningPlayers || []).map(p => ({ ...p, betAmount: (p.betAmount || 0) / 100, winningAmount: (p.winningAmount || 0) / 100 })),
+                        losingPlayers: (obj.losingPlayers || []).map(p => ({ ...p, betAmount: (p.betAmount || 0) / 100 })),
+                        colorStats: obj.colorStats ? {
+                            green: { ...obj.colorStats.green, amount: (obj.colorStats.green.amount || 0) / 100 },
+                            purple: { ...obj.colorStats.purple, amount: (obj.colorStats.purple.amount || 0) / 100 },
+                            blue: { ...obj.colorStats.blue, amount: (obj.colorStats.blue.amount || 0) / 100 }
+                        } : null
+                    };
+                }),
+                totalPages: Math.ceil(count / limit),
+                currentPage: parseInt(page),
+                totalRounds: count
+            }
+        });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false });
     }
 });
 
-// =======================
-// ERROR HANDLING (JSON ONLY)
-// =======================
-app.use((req, res) => {
-    console.warn(`404 hit: ${req.method} ${req.url}`);
-    res.status(404).json({ success: false, error: "Route not found. Ensure you are using the correct backend URL." });
-});
+// Admin Configuration Initializer
+async function initConfig() {
+    const defaultConfig = [
+        { key: 'referral_enabled', value: true, description: 'Master switch for referral system' },
+        { key: 'referral_reward_amount', value: 100000, description: 'Reward amount in Kobo (e.g. 100000 = ₦1000)' },
+        { key: 'min_deposit_for_referral', value: 200000, description: 'Minimum deposit required for qualification (Kobo)' },
+        { key: 'referral_qualification_enabled', value: true, description: 'Whether users need to deposit to qualify' },
+        { key: 'min_referral_deposit', value: 500000, description: 'Minimum first deposit for referral qualification (₦5000)' },
+        { key: 'min_gameplay_requirement', value: 500000, description: 'Minimum gameplay volume for referral qualification (₦5000)' },
 
-app.use((err, req, res, next) => {
-    console.error("CRITICAL SERVER ERROR:", err.stack);
-    res.status(500).json({ success: false, error: "An internal server error occurred. Please try again later." });
-});
+        // Phase 5: Bonus Configurations
+        { key: 'welcome_bonus_enabled', value: true, description: 'Enable Welcome Bonus for new users' },
+        { key: 'welcome_bonus', value: 100000, description: 'Welcome Bonus amount in Kobo (₦1000)' },
+        { key: 'first_deposit_bonus_enabled', value: true, description: 'Enable First Deposit Bonus' },
+        { key: 'first_deposit_bonus', value: 500000, description: 'First Deposit Bonus amount in Kobo (₦5000)' },
 
-io.on("connection", (socket) => {
-    const userId = socket.handshake.query.userId;
-    if (userId && userId !== 'user1') socket.join(userId);
-    socket.emit("game_update", { ...game, serverSeed: undefined });
-});
+        // Phase 8: Conversion & Withdrawal Rules
+        { key: 'restrict_withdrawal_with_active_bonus', value: false, description: 'Prevent withdrawal if user has locked bonuses' },
+        { key: 'min_deposit_wager_multiplier', value: 1, description: 'Required wagering multiplier of total deposits before withdrawal (Anti-Money Laundering)' },
 
-server.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server fully operational on port ${PORT}`));
+        // Default Wagering Requirements per type (can be overriden by campaigns)
+        { key: 'welcome_bonus_wagering_multiplier', value: 3, description: 'Wagering requirement multiplier for Welcome Bonus' },
+        { key: 'welcome_bonus_min_rounds', value: 5, description: 'Minimum rounds required for Welcome Bonus' },
+        { key: 'first_deposit_bonus_wagering_multiplier', value: 5, description: 'Wagering requirement multiplier for First Deposit Bonus' },
+        { key: 'first_deposit_bonus_min_rounds', value: 10, description: 'Minimum rounds required for First Deposit Bonus' },
+        { key: 'referral_reward_wagering_multiplier', value: 0, description: 'Wagering requirement multiplier for Referral Rewards' }
+    ];
+
+    for (const conf of defaultConfig) {
+        await Config.findOneAndUpdate(
+            { key: conf.key },
+            { $setOnInsert: conf },
+            { upsert: true }
+        );
+    }
+}
+
+if (MONGO_URI) mongoose.connect(MONGO_URI).then(() => {
+    console.log("✅ DB Connected");
+    startGameLoop();
+    initConfig();
+});
+server.listen(PORT, () => console.log(`🚀 Server running`));
