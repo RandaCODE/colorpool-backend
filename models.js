@@ -193,64 +193,6 @@ const transactionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, index: true }
 });
 
-const roundSchema = new mongoose.Schema({
-  roundId: { type: String, unique: true, index: true },
-  winner: String,
-  winningColor: String,
-  serverSeed: String,
-  serverSeedHash: String,
-  clientSeed: String,
-  forcedWinner: { type: String, default: null },
-  forcedBy: { type: String, default: null },
-  forcedAt: { type: Date, default: null },
-  forcedReason: { type: String, default: null },
-  isForced: { type: Boolean, default: false },
-  totalPool: { type: Number, default: 0 },
-  greenPool: { type: Number, default: 0 },
-  purplePool: { type: Number, default: 0 },
-  bluePool: { type: Number, default: 0 },
-  totalBets: { type: Number, default: 0 },
-  totalPayout: { type: Number, default: 0 },
-  houseProfit: { type: Number, default: 0 },
-  houseEdge: { type: Number, default: 0 },
-  playerCount: { type: Number, default: 0 },
-  pools: {
-    green: { type: Number, default: 0 },
-    purple: { type: Number, default: 0 },
-    blue: { type: Number, default: 0 }
-  },
-  colorStats: {
-    green: { players: { type: Number, default: 0 }, amount: { type: Number, default: 0 } },
-    purple: { players: { type: Number, default: 0 }, amount: { type: Number, default: 0 } },
-    blue: { players: { type: Number, default: 0 }, amount: { type: Number, default: 0 } }
-  },
-  winningPlayers: [{
-    username: String,
-    userId: String,
-    betAmount: Number,
-    winningAmount: Number
-  }],
-  losingPlayers: [{
-    username: String,
-    userId: String,
-    color: String,
-    betAmount: Number
-  }],
-  timeline: {
-    startedAt: Date,
-    lockedAt: Date,
-    resultAt: Date,
-    completedAt: Date
-  },
-  riskSnapshot: {
-    green: Number,
-    purple: Number,
-    blue: Number
-  },
-  timestamp: { type: Date, default: Date.now },
-  createdAt: { type: Date, default: Date.now, index: true }
-});
-
 transactionSchema.index({ userId: 1, createdAt: -1 });
 transactionSchema.index({ status: 1, type: 1 });
 
